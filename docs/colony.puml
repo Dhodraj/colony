@@ -1,0 +1,114 @@
+@startuml colony
+' How work moves through a colony. Explained in docs/colony.md.
+' This diagram has its own look (a green process style), so it does not use
+' ../style.iuml.
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Avenir Next"
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow false
+skinparam maxMessageSize 300
+
+<style>
+title {
+  FontName "Avenir Next"
+  FontSize 34
+  FontStyle bold
+  FontColor #111111
+  Margin 10 10 30 10
+}
+sequenceDiagram {
+  participant {
+    RoundCorner 12
+    LineThickness 1.6
+    LineColor #7C7C7C
+    FontSize 15
+    FontStyle bold
+    FontColor #6B6B6B
+    Padding 10
+  }
+  actor {
+    LineColor #7C7C7C
+  }
+  lifeLine {
+    LineColor #D0D0D0
+    LineThickness 1.4
+    LineStyle 0
+  }
+  arrow {
+    LineColor #6F6F6F
+    LineThickness 1.4
+    FontSize 13
+    FontColor #555555
+  }
+  group {
+    BackGroundColor #EAF7F1
+    LineColor #2DB37A
+    LineThickness 1.6
+    RoundCorner 22
+  }
+  groupHeader {
+    BackGroundColor #B3E6D3
+    LineColor #7C7C7C
+    FontSize 15
+    FontStyle bold
+    FontColor #555555
+  }
+  note {
+    BackGroundColor #F7FCFA
+    LineColor #7C7C7C
+    FontSize 13
+    FontColor #555555
+    RoundCorner 10
+  }
+}
+</style>
+
+title Colony Process Diagram
+footer <color:#9A9A9A>Explained in docs/colony.md</color>
+
+participant "User" as U #EEF8F4
+participant "Master\n<size:11>session</size>" as M [[../../colony.md]] #B3E6D3
+participant "colony\n<size:11>script</size>" as C [[../../../bin/colony.py]] #7FD4B5
+participant "Worker 1\n<size:11>session, own pane</size>" as W1 #55C59C
+participant "Worker 2\n<size:11>session, own pane</size>" as W2 #4CC197
+participant "<color:#F4FBF8>Event log</color>\n<color:#F4FBF8><size:11>file</size></color>" as L #22B07D
+participant "<color:#F4FBF8>Reviewer</color>\n<color:#F4FBF8><size:11>sub-agent of a worker</size></color>" as R #188A62
+
+U ->> M : give the goal
+
+group Colony work loop
+  M ->> M : plan tasks, write briefs
+  M ->> C : colony start T1
+  C ->> W1 : open a pane, send the brief
+  M ->> C : colony start T2
+  C ->> W2 : open a pane, send the brief
+  M ->> C : colony wait, in the background
+  W1 ->> W1 : do the task, run the tests
+  W1 ->> R : check against each criterion
+  R -->> W1 : findings
+  W1 ->> L : colony done T1 PASS
+  W2 ->> W2 : do the task
+  W2 ->> L : colony done T2 QUESTION
+  L ->> M : new outcomes, in one batch
+  M ->> M : confirm the cited lines
+  M ->> C : colony answer T2
+  C ->> W2 : the answer
+  W2 ->> U : the user's choices: question tool
+  U -->> W2 : answer
+  W2 ->> R : check against each criterion
+  R -->> W2 : findings
+  W2 ->> L : colony done T2 PASS
+  L ->> M : new outcome
+  M ->> M : confirm the cited lines
+  M ->> C : colony close T1, T2
+  rnote over M, W2
+    <size:15>**More tasks?**</size>
+    <color:#7C7C7C><size:18><&circle-x></size></color>  No: bring the results together
+    <color:#2DB37A><size:18><&circle-check></size></color>  Yes: brief the next tasks
+  end rnote
+end
+
+M ->> M : bring the results together
+M ->> U : result and open questions
+@enduml
