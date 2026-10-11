@@ -55,6 +55,7 @@ trail rather than by messages. Workers here coordinate through one event log.
 | Sub-agent | A helper inside one session, started by that session's Agent tool. Its result returns into that session's context |
 | Reviewer | A read-only sub-agent that a worker starts to check its result |
 | Checkpoint | The Master's state, written to a file before an opt-in restart |
+| Verdict | What the Master made of a result: accept, reject or partial. Recorded by `colony close`, and unset until then. Not the same as the worker's outcome |
 
 ## Workers are not sub-agents
 
@@ -179,7 +180,10 @@ The diagram at the top shows two tasks, one of which asks a question. For one ta
 7. Confirm: `colony wait` returns every new outcome. For a PASS, the Master
    checks the cited lines itself, with one search and one bounded read.
 8. Close: `colony close T1` records the worker's session ID and closes the
-   pane. The transcript stays and can be resumed.
+   pane. The transcript stays and can be resumed. `--accept`, `--reject` or
+   `--partial` records the Master's verdict on the result; without one the
+   verdict stays unset. A task that retries another names it at the start:
+   `colony start T2 <brief> --retry-of T1`.
 
 `colony wait` also reports a worker whose pane is gone (LOST) and one that
 stopped without reporting (IDLE). `colony status` shows one line per task.
@@ -248,6 +252,36 @@ pane and sessions), `master.md` (the checkpoint) and `wait.offset` (how far the
 Master has read). `COLONY_NAME` (default `main`) keeps several colonies in one
 project apart; workers inherit it.
 
+### Task state
+
+`tasks/<id>.json` holds what colony knows about one task: its id, agent, pane,
+brief, model, effort, working directory, and start and close times. It also
+holds the worker's session id. Four more fields record what nothing can
+reconstruct later.
+
+| Field | Written by | Meaning |
+|---|---|---|
+| `revision` | `colony start` | The committed HEAD of the project root when the task started, or `null` |
+| `dirty` | `colony start` | Whether the project tree differed from that commit, untracked files counted, or `null` |
+| `verdict` | `colony close --accept`, `--reject` or `--partial` | What the Master made of the result. `null` until the Master says |
+| `retry_of` | `colony start --retry-of <id>` | The task this one retries, or `null` |
+
+The revision and the dirty flag describe the project root, not the directory
+`colony start` ran in. The `cwd` field records that. When git cannot answer,
+both are `null` and `revision_unavailable` says why. A `null` is neither a
+clean tree nor a changed one: it means colony did not read one.
+
+A verdict is the Master's reading, not the worker's. A worker's PASS is its own
+claim, so `colony close` without a flag leaves the verdict unset. Nothing
+treats an unset verdict as an accepted task. A Master can still record one after
+closing the pane. `colony close <id> --accept` on a closed task writes the
+verdict and changes nothing else.
+
+The verdict is not an event. `events.log` keeps its five fields and its
+statuses, so a reader of the log still works, and so does the byte offset in
+`wait.offset`. A task file written before these fields loads as it stands, and
+colony adds no revision to it.
+
 ## Decisions and their reasons
 
 | Decision | Reason | Considered instead | Record |
@@ -263,6 +297,7 @@ project apart; workers inherit it.
 | Masters compact at 600k, other sessions at 800k | Every Master request carries its context, and its state lives in files (plan, ledger, event log, briefs). Other sessions keep more detail, at about 30% more tokens per hour once past 600k (estimated) | One window for every session; Masters at 200k | the design decision, 2026-10-06 |
 | Every brief pins a model and an effort; the policy lives in `colony-models.json`, and Opus 5.5 and Fable are banned | Opus 5.5 drained the user's tokens, so each worker should run the cheapest model that can pass. A pinned id, not a floating alias, keeps a worker off a banned or costlier model. One config file holds the policy, for a fork to set its own. Tests and an Opus 4.8 reviewer catch a cheaper worker's mistakes | A bare `opus` default; the Master picks any model; a hardcoded policy in the code | the design decision, 2026-10-08 |
 | `colony report` counts each token category, and prices them only from configured rates | One raw total hides that almost all of it is cache reads, which are priced apart from fresh input. Rates change and differ per plan, so a built-in price would be a guess | One token total; prices in the code | measured, 2026-10-11 |
+| A task records its revision, dirty flag, verdict and retried task | None of the four can be read back later: the tree moves on, and a worker's PASS is not the Master's verdict. Tokens for each accepted task cannot be counted without them | Read the revision from the transcript's `gitBranch`; take a PASS as acceptance | the design decision, 2026-10-11 |
 | Workers are sessions, not sub-agents | A sub-agent's result enters the Master's context, a background one starts a Master turn, and a sub-agent cannot ask the user (see [Workers are not sub-agents](#workers-are-not-sub-agents)) | Sub-agents started by the Master's Agent tool, in the foreground or the background | this page |
 | Herdr panes | The user works in Herdr, and a worker can ask the user in its own pane | Agent teams: experimental and they cannot use Herdr panes. Headless `claude -p`: cannot ask the user and is not visible. OpenRig: did not meet the requirements | the OpenRig spike |
 | State outside the project | The colony must not change project files; each project decides its own ledger | A ledger file in each repo | the design decision |
@@ -301,7 +336,7 @@ the Master checks facts at their source.
 | LIVE1: one worker, one-step task | 2026-10-06 | Every step worked. 5 requests, 194k tokens | measured |
 | Benchmark: a new Master and three parallel workers on a research question | 2026-10-06 | Every step worked, including a question, three PASS outcomes, the Master's checks and a restart. 291 requests, 37.8M tokens, about 130k a request. Workers started at 38k | measured |
 | The same 291 requests at the old median context sizes | 2026-10-06 | About 185M tokens, about 5 times as much | estimated, same benchmark |
-| Tests | 2026-10-11 | 143 cases pass against a fake Herdr | `bash tests/colony.sh` |
+| Tests | 2026-10-11 | 182 cases pass against a fake Herdr | `bash tests/colony.sh` |
 | The ledger against the archive | 2026-10-11 | 98 sessions (86 workers, 12 Masters) and their 144 sub-agent transcripts: a second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught | measured, `python3 tests/archive-check.py` |
 
 The benchmark found two faults in `colony report`, both fixed: it undercounted
@@ -318,6 +353,12 @@ output tokens, and it missed the Master's session after a restart.
   token. So a price-weighted figure is not a plan-limit figure.
 - A worker's reviewer cannot be told from its other sub-agents, because no
   agent type is called "reviewer". Reviewer cost is not separated.
+- The dirty flag says only that the tree differed from the commit. It does not
+  say how, so a revision does not identify the code a worker read when the flag
+  is true.
+- No task started before 2026-10-11 has a revision, a dirty flag or a verdict.
+  A count of tokens for each accepted task starts from the next task.
+- Nothing reads the verdict yet. `colony report` does not show it.
 - `colony report` looks for transcripts under `CLAUDE_CONFIG_DIR`. A session
   that ran with another config directory reports as unmeasured.
 - A background command stops after 30 minutes unless its Bash call sets a
@@ -380,6 +421,7 @@ work.
 | 2026-10-08 | A brief may pin Opus 4.8 with `claude-opus-4-8`; `opus` still means the newest Opus | the design decision |
 | 2026-10-08 | Every brief pins a model and an effort; the policy moves to `colony-models.json`; bare aliases dropped; Opus 5.5 and Fable banned; the reviewer runs `claude-opus-4-8` | the design decision |
 | 2026-10-11 | `colony report` counts input, output, thinking, cache reads and both cache writes, adds a row for each sub-agent, flags the pinned model against the served one, prices from an optional config block, and prints `--json` | the design decision |
+| 2026-10-11 | A task records `revision`, `dirty`, `verdict` and `retry_of`; `colony close` takes `--accept`, `--reject` or `--partial`, and `colony start` takes `--retry-of` | the design decision |
 
 ## Where to go next
 

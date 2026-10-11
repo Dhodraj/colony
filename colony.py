@@ -12,10 +12,12 @@ of outcomes and reads detail only when something failed.
 
 Master:
   colony brief <id> [--result PATH]          write a brief template; prints its path
-  colony start <id> <brief> [--model M] [--effort E]  open a pane, start a worker, send the brief
+  colony start <id> <brief> [--model M] [--effort E] [--retry-of ID]
+                                             open a pane, start a worker, send the brief
   colony wait [--timeout S]                  block until new outcomes, then print them
   colony answer <id> <text>                  reply to a worker that asked a QUESTION
-  colony close <id> [--force]                record the worker's session ID, close its pane
+  colony close <id> [--force] [--accept|--reject|--partial]
+                                             record the session ID, close the pane, set the verdict
   colony status [--all]                      one line per task
   colony report [--json]                     tokens per worker and for the Master
   colony checkpoint                          write the Master's state file; prints its path
@@ -43,6 +45,9 @@ import time
 from datetime import datetime, timezone
 
 OUTCOMES = ("PASS", "FAIL", "BLOCKED", "QUESTION")
+# What the Master made of a result, recorded by colony close. A worker's PASS is
+# its own claim; the verdict is the Master's, and stays unset until it gives one.
+VERDICTS = ("accept", "reject", "partial")
 # Statuses that wake the Master: worker outcomes plus the ones colony itself detects.
 REPORTED = OUTCOMES + ("LOST", "IDLE", "START-FAILED")
 SUMMARY_MAX = 300
@@ -167,6 +172,40 @@ def project_root():
     except (OSError, subprocess.SubprocessError):
         pass
     return os.getcwd()
+
+
+def git_state(root):
+    """(revision, dirty, reason) for a project root.
+
+    revision is the committed HEAD. dirty says whether the tree differs from
+    it, counting untracked files, because a worker reads those too. reason
+    says why either is unknown.
+
+    A check that fails gives None, never a revision colony did not read and
+    never a clean tree it could not confirm. The revision can be known while
+    dirty is not, so the two are reported apart.
+    """
+    def git(*args):
+        try:
+            out = subprocess.run(["git", "-C", root, *args],
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, f"git {args[0]} failed: {e}"
+        if out.returncode != 0:
+            first = (out.stderr.strip().splitlines() or [f"git exited {out.returncode}"])[0]
+            return None, f"git {args[0]}: {first}"
+        return out.stdout, None
+
+    head, why = git("rev-parse", "HEAD")
+    if head is None:
+        return None, None, why
+    revision = head.strip()
+    if not revision:
+        return None, None, "git rev-parse HEAD printed nothing"
+    status, why = git("status", "--porcelain")
+    if status is None:
+        return revision, None, why
+    return revision, bool(status.strip()), None
 
 
 def colony_name():
@@ -484,6 +523,19 @@ def cmd_start(a):
     sd = state_dir()
     if os.path.exists(os.path.join(sd, "tasks", task_id + ".json")):
         raise ColonyError(f"task {task_id} exists already; use a new id")
+    retry_of = None
+    if a.retry_of:
+        retry_of = check_id(a.retry_of)
+        if retry_of == task_id:
+            raise ColonyError(f"--retry-of {retry_of} is this task's own id; "
+                              "name the task it retries")
+        try:
+            load_task(sd, retry_of)
+        except ColonyError:
+            raise ColonyError(f"no task {retry_of} in colony {colony_name()} to retry; "
+                              "colony status --all lists the tasks")
+    # The code a worker starts from cannot be recovered once the tree moves on.
+    revision, dirty, why_no_revision = git_state(project_root())
     meta_path = os.path.join(sd, "colony.json")
     meta = load_json(meta_path, {})
     if not meta.get("master_session"):
@@ -516,8 +568,12 @@ def cmd_start(a):
         herdr_quiet("pane", "close", pane)
         append_event(sd, task_id, "START-FAILED", "-", str(e))
         raise
-    save_task(sd, {"id": task_id, "agent": name, "pane": pane, "brief": brief, "model": model,
-                   "effort": effort, "cwd": cwd, "started": now(), "closed": None, "session": None})
+    task = {"id": task_id, "agent": name, "pane": pane, "brief": brief, "model": model,
+            "effort": effort, "cwd": cwd, "started": now(), "closed": None, "session": None,
+            "revision": revision, "dirty": dirty, "verdict": None, "retry_of": retry_of}
+    if why_no_revision:
+        task["revision_unavailable"] = why_no_revision
+    save_task(sd, task)
     append_event(sd, task_id, "STARTED", brief,
                  f"pane {pane}, agent {name}, model {model}, effort {effort}")
     print(f"started {task_id}: pane {pane}, agent {name}")
@@ -627,13 +683,29 @@ def cmd_wait(a):
         time.sleep(max(0.05, min(2, CHECK_EVERY, deadline - time.monotonic())))
 
 
+def close_verdict(a):
+    """The verdict its flags name, or None. Two flags are an error."""
+    named = [v for v in VERDICTS if getattr(a, v, False)]
+    if len(named) > 1:
+        raise ColonyError("name one verdict, not " + ", ".join("--" + v for v in named))
+    return named[0] if named else None
+
+
 def cmd_close(a):
     task_id = check_id(a.id)
+    verdict = close_verdict(a)
     sd = state_dir()
     note_master_session(sd)
     task = load_task(sd, task_id)
     if task.get("closed"):
-        print(f"{task_id} was closed at {task['closed']}")
+        # A Master often confirms a result after closing the pane, so a verdict
+        # can still be recorded. Nothing else changes, and no event is written.
+        if verdict:
+            task["verdict"] = verdict
+            save_task(sd, task)
+            print(f"{task_id} was closed at {task['closed']}; verdict {verdict}")
+        else:
+            print(f"{task_id} was closed at {task['closed']}")
         return
     session = None
     try:
@@ -648,9 +720,11 @@ def cmd_close(a):
             raise
     task["closed"] = now()
     task["session"] = session
+    task["verdict"] = verdict
     save_task(sd, task)
     append_event(sd, task_id, "CLOSED", session or "-", "")
-    print(f"closed {task_id}; session {session or 'unknown'}")
+    print(f"closed {task_id}; session {session or 'unknown'}"
+          + (f"; verdict {verdict}" if verdict else ""))
 
 
 def status_lines(sd, show_all):
@@ -1158,6 +1232,8 @@ def main(argv=None):
     s.add_argument("--model", help="the worker's model; overrides the brief's Model section")
     s.add_argument("--effort", help="the worker's effort; overrides the brief's Effort section")
     s.add_argument("--no-check", action="store_true", help="skip the brief section check")
+    s.add_argument("--retry-of", dest="retry_of", metavar="ID",
+                   help="the task this one retries; it must exist in this colony")
     s.set_defaults(func=cmd_start)
     d = sub.add_parser("done", help="record a worker's outcome")
     d.add_argument("id")
@@ -1177,6 +1253,9 @@ def main(argv=None):
     c = sub.add_parser("close", help="record the session ID and close the pane")
     c.add_argument("id")
     c.add_argument("--force", action="store_true", help="close even if the worker waits for input")
+    for name in VERDICTS:
+        c.add_argument(f"--{name}", action="store_true",
+                       help=f"record the Master's verdict on the result: {name}")
     c.set_defaults(func=cmd_close)
     st = sub.add_parser("status", help="one line per task")
     st.add_argument("--all", action="store_true", help="include closed tasks")

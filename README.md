@@ -40,10 +40,13 @@ Master:
 
 - `colony brief <id>` writes a brief template and prints its path.
 - `colony start <id> <brief>` opens a pane, starts a worker, and sends it the
-  brief.
+  brief. `--retry-of <id>` names the task this one retries.
 - `colony wait` blocks until new outcomes, then prints them.
 - `colony answer <id> <text>` replies to a worker that asked a QUESTION.
 - `colony close <id>` records the session ID and closes the pane.
+  `--accept`, `--reject` or `--partial` records the Master's verdict on the
+  result. Without one the verdict stays unset, and a worker's PASS is never
+  read as acceptance.
 - `colony status` prints one line per task; `--all` includes closed tasks.
 - `colony report` shows tokens per worker and for the Master, where those
   tokens went by category, and a cost when the config holds rates.
@@ -120,7 +123,7 @@ bash tests/colony.sh
 ```
 
 The tests run colony against a fake `herdr`, so they need no real Herdr. There
-are 143 cases.
+are 182 cases.
 
 ```sh
 python3 tests/archive-check.py

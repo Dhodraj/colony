@@ -318,5 +318,79 @@ echo '{"banned":[],"worker_models":["m"],"master_model":"m","reviewer_model":"m"
 COLONY_MODELS_CONFIG="$T/badprice.json" COLONY_NAME=led run report
 check "bad pricing block refused" 2 $rc "must be an object with a models object" "$out"
 
+# Task metadata: revision, dirty, verdict and retry lineage.
+# $T/proj is not a Git repository, so start records no revision and says why.
+brief MD1
+run start MD1 MD1.md;                           check "metadata start" 0 $rc "started MD1" "$out"
+MD1J="$(cat "$SD/tasks/MD1.json")"
+check "no revision outside a repo" 0 0 '"revision": null' "$MD1J"
+check "no dirty flag outside a repo" 0 0 '"dirty": null' "$MD1J"
+check "says why there is no revision" 0 0 '"revision_unavailable": "git rev-parse' "$MD1J"
+check "verdict starts unset" 0 0 '"verdict": null' "$MD1J"
+check "retry_of starts unset" 0 0 '"retry_of": null' "$MD1J"
+FAKE_SESSION=sess-m1 run close MD1;            check "close without a verdict" 0 $rc "closed MD1; session sess-m1" "$out"
+absent "close says nothing of a verdict" "verdict" "$out"
+check "verdict stays unset" 0 0 '"verdict": null' "$(cat "$SD/tasks/MD1.json")"
+run close MD1 --accept;                        check "verdict after closing" 0 $rc "was closed at" "$out"
+check "verdict after closing is named" 0 0 "verdict accept" "$out"
+check "verdict recorded" 0 0 '"verdict": "accept"' "$(cat "$SD/tasks/MD1.json")"
+check "verdict keeps the revision fields" 0 0 '"revision": null' "$(cat "$SD/tasks/MD1.json")"
+run close MD1 --accept --reject;               check "two verdicts refused" 2 $rc "name one verdict, not --accept, --reject" "$out"
+brief MD2
+run start MD2 MD2.md;                           check "metadata start MD2" 0 $rc "started MD2" "$out"
+FAKE_SESSION=sess-m2 run close MD2 --partial;  check "partial verdict" 0 $rc "verdict partial" "$out"
+check "partial recorded" 0 0 '"verdict": "partial"' "$(cat "$SD/tasks/MD2.json")"
+brief MD3
+run start MD3 MD3.md
+FAKE_SESSION=sess-m3 run close MD3 --reject;   check "reject verdict" 0 $rc "verdict reject" "$out"
+check "reject recorded" 0 0 '"verdict": "reject"' "$(cat "$SD/tasks/MD3.json")"
+
+# Retry lineage
+brief MD4
+run start MD4 MD4.md --retry-of MD1;             check "retry start" 0 $rc "started MD4" "$out"
+check "retry recorded" 0 0 '"retry_of": "MD1"' "$(cat "$SD/tasks/MD4.json")"
+brief MD5
+run start MD5 MD5.md --retry-of NOPE;           check "retry of an unknown task" 2 $rc "no task NOPE in colony main to retry" "$out"
+absent "a refused retry starts nothing" "started MD5" "$out"
+run start MD5 MD5.md --retry-of MD5;             check "retry of itself" 2 $rc "own id" "$out"
+run start MD5 MD5.md --retry-of "bad id!";      check "retry of a bad id" 2 $rc "bad task id" "$out"
+
+# A task file written before these fields loads and takes a verdict, and colony
+# invents no revision for it.
+printf '{"id":"OLD","agent":"w-old","pane":"w9:p99","brief":"%s","model":"claude-opus-4-8","effort":"high","cwd":"%s","started":"2026-01-01T00:00:00Z","closed":"2026-01-01T00:30:00Z","session":null}\n' "$T/proj/T1.md" "$T/proj" > "$SD/tasks/OLD.json"
+run report;                                   check "an old task file loads" 0 $rc "OLD	opus-4-8	-	-	-	-" "$out"
+run close OLD --accept;                       check "an old task takes a verdict" 0 $rc "verdict accept" "$out"
+OLDJ="$(cat "$SD/tasks/OLD.json")"
+check "the old task keeps its verdict" 0 0 '"verdict": "accept"' "$OLDJ"
+absent "no revision invented for an old task" '"revision"' "$OLDJ"
+
+# A real repository: the revision and dirty state describe the project root,
+# not the directory colony start ran in.
+G="$T/gitproj"
+mkdir -p "$G/sub"
+git -C "$G" init -q -b main
+echo tracked > "$G/a.txt"
+git -C "$G" add a.txt
+git -C "$G" -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -qm init
+HEAD_SHA="$(git -C "$G" rev-parse HEAD)"
+GSD="$COLONY_HOME/$(python3 -c 'import re,sys;print(re.sub(r"[^A-Za-z0-9]","-",sys.argv[1]))' "$G")/main"
+brief G1
+cd "$G/sub"
+run start G1 "$T/proj/G1.md";                 check "start inside a repo" 0 $rc "started G1" "$out"
+G1J="$(cat "$GSD/tasks/G1.json")"
+check "revision is the committed HEAD" 0 0 "\"revision\": \"$HEAD_SHA\"" "$G1J"
+check "a clean tree is not dirty" 0 0 '"dirty": false' "$G1J"
+check "cwd is where start ran" 0 0 "\"cwd\": \"$G/sub\"" "$G1J"
+absent "a clean read needs no reason" "revision_unavailable" "$G1J"
+echo untracked > "$G/b.txt"
+cd "$T/proj"; brief G2; cd "$G/sub"
+run start G2 "$T/proj/G2.md";                 check "start with a dirty tree" 0 $rc "started G2" "$out"
+check "an untracked file is dirty" 0 0 '"dirty": true' "$(cat "$GSD/tasks/G2.json")"
+FAKE_SESSION=sess-g1 run close G1 --accept;   check "verdict in a repo" 0 $rc "verdict accept" "$out"
+G1J="$(cat "$GSD/tasks/G1.json")"
+check "the revision survives a close" 0 0 "\"revision\": \"$HEAD_SHA\"" "$G1J"
+check "the dirty flag survives a close" 0 0 '"dirty": false' "$G1J"
+cd "$T/proj"
+
 echo "colony tests: $pass passed, $fail failed"
 [[ $fail = 0 ]]
