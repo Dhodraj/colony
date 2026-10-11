@@ -3,5 +3,6 @@
   "worker_models": ["claude-opus-5", "claude-opus-4-8", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-4-5-20251001"],
   "master_model": "claude-opus-4-8",
   "reviewer_model": "claude-opus-4-8",
-  "efforts": ["low", "medium", "high", "xhigh", "max"]
+  "efforts": ["low", "medium", "high", "xhigh", "max"],
+  "pricing": {"units": "USD per million tokens", "models": {}}
 }

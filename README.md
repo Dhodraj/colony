@@ -45,7 +45,9 @@ Master:
 - `colony answer <id> <text>` replies to a worker that asked a QUESTION.
 - `colony close <id>` records the session ID and closes the pane.
 - `colony status` prints one line per task; `--all` includes closed tasks.
-- `colony report` shows tokens per worker and for the Master.
+- `colony report` shows tokens per worker and for the Master, where those
+  tokens went by category, and a cost when the config holds rates.
+  `--json` prints the same report as data.
 - `colony checkpoint` writes the Master's state file and prints its path.
 - `colony restart --confirm` clears the Master and resumes it from the
   checkpoint.
@@ -90,6 +92,12 @@ The policy lives in `colony-models.json`. Its keys:
 - `master_model`: the model the Master should run.
 - `reviewer_model`: the model each worker's reviewer sub-agent runs.
 - `efforts`: the allowed effort levels.
+- `pricing` (optional): `units`, and a `models` map of rates per million
+  tokens. A rate set may name `input`, `output`, `cache_read`,
+  `cache_write_1h` and `cache_write_5m`. A model is priced only when every
+  category it used has a rate, so `colony report` shows no cost rather than a
+  low one. Colony ships the block empty: read the rates from the vendor's
+  current price list. A config without the block stays valid.
 
 Edit the config, not the code, to set your own policy.
 
@@ -112,7 +120,16 @@ bash tests/colony.sh
 ```
 
 The tests run colony against a fake `herdr`, so they need no real Herdr. There
-are 95 cases.
+are 143 cases.
+
+```sh
+python3 tests/archive-check.py
+```
+
+`tests/archive-check.py` reconciles `colony report`'s token counts against the
+real transcripts of every session the colonies recorded. It counts each session
+a second way and compares. It reads only, needs no Herdr, and exits non-zero
+when a count differs.
 
 ## Documentation
 

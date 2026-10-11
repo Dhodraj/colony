@@ -17,7 +17,7 @@ Master:
   colony answer <id> <text>                  reply to a worker that asked a QUESTION
   colony close <id> [--force]                record the worker's session ID, close its pane
   colony status [--all]                      one line per task
-  colony report                              tokens per worker and for the Master
+  colony report [--json]                     tokens per worker and for the Master
   colony checkpoint                          write the Master's state file; prints its path
   colony restart --confirm                   clear the Master and resume it from the checkpoint
 Worker:
@@ -271,7 +271,28 @@ def models_config():
     for key in ("banned", "worker_models", "master_model", "reviewer_model", "efforts"):
         if key not in data:
             raise ColonyError(f"the colony model config at {path} lacks {key!r}")
+    check_pricing(data, path)
     return data
+
+
+def check_pricing(cfg, path):
+    """Validate the optional pricing block. A config without one stays valid."""
+    block = cfg.get("pricing")
+    if block is None:
+        return
+    if not isinstance(block, dict) or not isinstance(block.get("models", {}), dict):
+        raise ColonyError(f"the pricing block in {path} must be an object with a models object")
+    for model, rate in (block.get("models") or {}).items():
+        if not isinstance(rate, dict):
+            raise ColonyError(f"the pricing rates for {model!r} in {path} must be an object")
+        unknown = sorted(set(rate) - set(RATE_KEYS))
+        if unknown:
+            raise ColonyError(f"the pricing rates for {model!r} in {path} name "
+                              + ", ".join(unknown) + "; use " + ", ".join(RATE_KEYS))
+        for key, value in rate.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                raise ColonyError(f"the pricing rate {model!r}.{key} in {path} must be a "
+                                  "number of currency units per million tokens, not negative")
 
 
 def check_model(cfg, value):
@@ -653,14 +674,21 @@ def projects_dir():
 
 
 def transcript_usage(path, since=None):
-    """Requests, tokens and first-request context of one transcript.
+    """Per-category usage of one transcript, split by the model that served it.
 
-    A response can appear several times while it streams, with a growing output
-    count, so each response counts once, with its largest output.
+    A response can appear several times while it streams. Within one
+    (message id, request id) the input and cache counts never change, and the
+    output and thinking counts only grow: measured over 11,276 duplicate
+    groups in 235 archived transcripts on 2026-10-11. So each response counts
+    once, with its largest output and thinking.
+
+    thinking_unknown counts responses whose copies all lacked
+    output_tokens_details.thinking_tokens. There the field is missing, not
+    zero, so the caller must not read a 0 sum as "no thinking".
     """
     seen = {}
-    models = {}
-    with open(path, encoding="utf-8") as f:
+    order = []
+    with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             if '"usage"' not in line:
                 continue
@@ -675,79 +703,412 @@ def transcript_usage(path, since=None):
             if since and rec.get("timestamp", "") < since:
                 continue
             key = (msg.get("id"), rec.get("requestId"))
-            ctx = (usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-                   + usage.get("cache_creation_input_tokens", 0))
+            details = usage.get("output_tokens_details")
+            think = None
+            if isinstance(details, dict) and "thinking_tokens" in details:
+                think = details["thinking_tokens"]
             out = usage.get("output_tokens", 0)
-            if key in seen:
-                seen[key][1] = max(seen[key][1], out)
+            entry = seen.get(key)
+            if entry is None:
+                creation = usage.get("cache_creation") or {}
+                seen[key] = {
+                    "model": msg.get("model") or "-",
+                    "input": usage.get("input_tokens", 0),
+                    "cache_read": usage.get("cache_read_input_tokens", 0),
+                    "cache_write": usage.get("cache_creation_input_tokens", 0),
+                    # The 1h/5m split is on cache writes only.
+                    # cache_read_input_tokens is one scalar with no TTL split,
+                    # so none is reported for reads.
+                    "cache_write_1h": creation.get("ephemeral_1h_input_tokens", 0),
+                    "cache_write_5m": creation.get("ephemeral_5m_input_tokens", 0),
+                    "output": out,
+                    "thinking": think,
+                    "effort": rec.get("effort"),
+                    "per_turn_effort": rec.get("perTurnEffort"),
+                    "requested_model": rec.get("requestedModel"),
+                }
+                order.append(key)
             else:
-                seen[key] = [ctx, out]
-                name = (msg.get("model") or "").replace("claude-", "")
-                if name:
-                    models[name] = models.get(name, 0) + 1
-    values = list(seen.values())
-    tokens = sum(c + o for c, o in values)
-    model = max(models, key=models.get) if models else "-"
-    return len(values), tokens, (values[0][0] if values else 0), model
+                entry["output"] = max(entry["output"], out)
+                if think is not None:
+                    entry["thinking"] = think if entry["thinking"] is None \
+                        else max(entry["thinking"], think)
+    return summarize([seen[k] for k in order])
+
+
+def blank_usage():
+    return {"requests": 0, "tokens": 0, "first_context": 0, "input": 0, "output": 0,
+            "thinking": 0, "thinking_unknown": 0, "cache_read": 0, "cache_write": 0,
+            "cache_write_1h": 0, "cache_write_5m": 0, "by_model": {}, "efforts": {},
+            "per_turn_efforts": {}, "requested_models": {}}
+
+
+def summarize(responses):
+    """Totals, per-model totals and per-request settings of deduplicated responses."""
+    u = blank_usage()
+    for i, r in enumerate(responses):
+        # Context is what the request carried: fresh input plus both cache parts.
+        ctx = r["input"] + r["cache_read"] + r["cache_write"]
+        if i == 0:
+            u["first_context"] = ctx
+        u["requests"] += 1
+        u["tokens"] += ctx + r["output"]
+        m = u["by_model"].setdefault(r["model"], {
+            "requests": 0, "tokens": 0, "input": 0, "output": 0, "thinking": 0,
+            "thinking_unknown": 0, "cache_read": 0, "cache_write": 0,
+            "cache_write_1h": 0, "cache_write_5m": 0})
+        m["requests"] += 1
+        m["tokens"] += ctx + r["output"]
+        for key in ("input", "output", "cache_read", "cache_write",
+                    "cache_write_1h", "cache_write_5m"):
+            u[key] += r[key]
+            m[key] += r[key]
+        if r["thinking"] is None:
+            u["thinking_unknown"] += 1
+            m["thinking_unknown"] += 1
+        else:
+            u["thinking"] += r["thinking"]
+            m["thinking"] += r["thinking"]
+        for key, value in (("efforts", r["effort"]),
+                           ("per_turn_efforts", r["per_turn_effort"]),
+                           ("requested_models", r["requested_model"])):
+            if value is None:
+                continue
+            name = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+            u[key][name] = u[key].get(name, 0) + 1
+    return u
+
+
+def add_usage(into, other):
+    """Add one usage summary into another. first_context keeps the earlier one."""
+    for key in ("requests", "tokens", "input", "output", "thinking", "thinking_unknown",
+                "cache_read", "cache_write", "cache_write_1h", "cache_write_5m"):
+        into[key] += other[key]
+    for model, totals in other["by_model"].items():
+        target = into["by_model"].setdefault(model, {k: 0 for k in totals})
+        for key, value in totals.items():
+            target[key] = target.get(key, 0) + value
+    for field in ("efforts", "per_turn_efforts", "requested_models"):
+        for name, count in other[field].items():
+            into[field][name] = into[field].get(name, 0) + count
+    return into
+
+
+def top_model(usage):
+    """The model that served the most requests, or None when none did."""
+    models = usage["by_model"]
+    return max(models, key=lambda m: models[m]["requests"]) if models else None
 
 
 def session_usage(session, since=None):
-    """Usage of a session and its sub-agents: (requests, tokens, first context, sub-agent tokens, model)."""
+    """A session's own usage and one entry per sub-agent transcript, or None.
+
+    A sub-agent entry carries its agentType and description from its
+    agent-<id>.meta.json. Claude Code never names an agent type "reviewer", so
+    a worker's bounded reviewer cannot be told apart from its other sub-agents
+    here; the type and description are reported as they stand.
+    """
     if not session:
         return None
     main = glob.glob(os.path.join(projects_dir(), "*", session + ".jsonl"))
     if not main:
         return None
-    req, tok, first, model = transcript_usage(main[0], since)
-    sub_tok = 0
-    for path in glob.glob(os.path.join(main[0][:-len(".jsonl")], "subagents", "*.jsonl")):
-        r, t, _, _ = transcript_usage(path, since)
-        req += r
-        sub_tok += t
-    return req, tok + sub_tok, first, sub_tok, model
+    own = transcript_usage(main[0], since)
+    subs = []
+    for path in sorted(glob.glob(os.path.join(main[0][:-len(".jsonl")], "subagents", "*.jsonl"))):
+        sub = transcript_usage(path, since)
+        meta = load_json(path[:-len(".jsonl")] + ".meta.json", {}) or {}
+        sub["file"] = os.path.basename(path)
+        sub["agent_type"] = meta.get("agentType")
+        sub["description"] = meta.get("description")
+        subs.append(sub)
+    total = add_usage(blank_usage(), own)
+    total["first_context"] = own["first_context"]
+    for sub in subs:
+        add_usage(total, sub)
+    return {"session": session, "transcript": main[0], "own": own, "subs": subs,
+            "total": total}
+
+
+# Rates are per million tokens, by the category the tokens fall in. A model is
+# priced only when every category it actually used has a rate, so a half-filled
+# rate set reports no cost instead of a low one.
+RATE_KEYS = ("input", "output", "cache_read", "cache_write_1h", "cache_write_5m")
+
+
+def pricing_rates(cfg):
+    """The configured model rates, or {} when the config has no pricing block."""
+    block = cfg.get("pricing") or {}
+    return block.get("models") or {}
+
+
+def cost_estimate(cfg, usage):
+    """(cost in the configured currency, [reasons it is unavailable]).
+
+    cost is None when no model could be priced. A model is skipped, with a
+    reason, when it has no rate set, when a category it used has no rate, or
+    when it is <synthetic>: a synthetic response was not served by a model and
+    is not billed.
+    """
+    rates = pricing_rates(cfg)
+    cost = None
+    reasons = []
+    for model, totals in sorted(usage["by_model"].items()):
+        if model.startswith("<"):
+            reasons.append(f"{model}: not a served model, not priced")
+            continue
+        rate = rates.get(model)
+        if not rate:
+            reasons.append(f"{model}: no rate in the pricing config")
+            continue
+        used = [k for k in RATE_KEYS if totals.get(k)]
+        missing = [k for k in used if rate.get(k) is None]
+        if missing:
+            reasons.append(f"{model}: no rate for " + ", ".join(missing))
+            continue
+        amount = sum(totals[k] * rate[k] / 1_000_000 for k in used)
+        cost = amount if cost is None else cost + amount
+    return cost, reasons
 
 
 def fmt_k(n):
     return f"{n / 1000:,.0f}k"
 
 
-def cmd_report(a):
-    sd = state_dir()
-    note_master_session(sd)
-    meta = load_json(os.path.join(sd, "colony.json"), {})
-    tasks = all_tasks(sd)
-    if not tasks:
-        print("no tasks")
-        return
-    print("task\tmodel\trequests\ttokens\tfirst context\tsub-agents\tminutes")
-    total = 0
-    for t in tasks:
-        session = t.get("session")
-        if not session and not t.get("closed"):
-            try:
-                pane = herdr("pane", "get", t["pane"])["result"]["pane"]
-                session = (pane.get("agent_session") or {}).get("value")
-            except (ColonyError, KeyError, TypeError):
-                session = None
-        u = session_usage(session)
-        end = parse_ts(t["closed"]) if t.get("closed") else datetime.now(timezone.utc)
-        minutes = int((end - parse_ts(t["started"])).total_seconds() // 60)
-        if u is None:
-            print(f"{t['id']}\t{t.get('model') or '-'}\t-\t-\t-\t-\t{minutes}")
-            continue
-        req, tok, first, sub, model = u
-        total += tok
-        print(f"{t['id']}\t{model}\t{req}\t{fmt_k(tok)}\t{fmt_k(first)}\t{fmt_k(sub)}\t{minutes}")
+def fmt_thinking(usage):
+    """Thinking tokens, or - when no response in the set reported the field."""
+    if usage["requests"] and usage["thinking_unknown"] == usage["requests"]:
+        return "-"
+    return fmt_k(usage["thinking"])
+
+
+def fmt_cost(cost):
+    return "-" if cost is None else f"{cost:,.2f}"
+
+
+def short_model(model):
+    return (model or "-").replace("claude-", "")
+
+
+def task_session(task):
+    """A task's worker session: the recorded one, or the open pane's."""
+    session = task.get("session")
+    if session or task.get("closed"):
+        return session
+    try:
+        pane = herdr("pane", "get", task["pane"])["result"]["pane"]
+        return (pane.get("agent_session") or {}).get("value")
+    except (ColonyError, KeyError, TypeError):
+        return None
+
+
+def report_rows(sd, meta, tasks):
+    """One row per worker and per Master session, newest Master last.
+
+    A row is {"label", "kind", "task", "pinned_model", "pinned_effort",
+    "minutes", "since", "usage" or None}. usage is None when the session's
+    transcript was not found, which the report shows as - rather than 0.
+    """
+    rows = []
+    for task in tasks:
+        usage = session_usage(task_session(task))
+        end = parse_ts(task["closed"]) if task.get("closed") else datetime.now(timezone.utc)
+        rows.append({"label": task["id"], "kind": "worker", "task": task["id"],
+                     "pinned_model": task.get("model"), "pinned_effort": task.get("effort"),
+                     "minutes": int((end - parse_ts(task["started"])).total_seconds() // 60),
+                     "since": None, "usage": usage})
     since = min(t["started"] for t in tasks)
     sessions = meta.get("master_sessions") or [meta.get("master_session")]
     for i, session in enumerate(s for s in sessions if s):
-        m = session_usage(session, since)
-        if m:
-            req, tok, _, sub, model = m
-            label = "Master" if i == 0 else f"Master after restart {i}"
-            print(f"{label} (since {since})\t{model}\t{req}\t{fmt_k(tok)}\t-\t{fmt_k(sub)}\t-")
-            total += tok
+        usage = session_usage(session, since)
+        if not usage:
+            continue
+        label = "Master" if i == 0 else f"Master after restart {i}"
+        rows.append({"label": label, "kind": "master", "task": None,
+                     "pinned_model": None, "pinned_effort": None, "minutes": None,
+                     "since": since, "usage": usage})
+    return rows, since
+
+
+def name_list(labels, most=8):
+    """At most `most` labels, then how many more."""
+    shown = ", ".join(labels[:most])
+    return shown if len(labels) <= most else f"{shown} +{len(labels) - most} more"
+
+
+def report_notes(cfg, rows):
+    """Everything the numbers do not say: drift, missing data, unpriced models.
+
+    Notes are grouped, not repeated per row: a Master reads this report, and
+    every repeated line costs it context.
+    """
+    notes = []
+    missing, drift, synthetic, partial, unpriced, asked = [], {}, [], [], {}, {}
+    thin_rows = thin_responses = thin_total = 0
+    for row in rows:
+        usage = row["usage"]
+        if usage is None:
+            missing.append(row["label"])
+            continue
+        total = usage["total"]
+        served = top_model(total)
+        pinned = row["pinned_model"]
+        if pinned and served and pinned != served:
+            drift.setdefault((pinned, served), []).append(row["label"])
+        for model, counts in sorted(total["requested_models"].items()):
+            asked.setdefault(model, []).append(f"{row['label']} x{counts}")
+        if total["thinking_unknown"]:
+            thin_rows += 1
+            thin_responses += total["thinking_unknown"]
+            thin_total += total["requests"]
+            partial.append(row["label"])
+        for model, totals in sorted(total["by_model"].items()):
+            if model.startswith("<"):
+                synthetic.append(f"{row['label']} x{totals['requests']}")
+        for reason in cost_estimate(cfg, total)[1]:
+            unpriced.setdefault(reason, []).append(row["label"])
+    if missing:
+        notes.append(f"no transcript found for {len(missing)} row(s), so their usage is "
+                     f"unavailable, not zero: {name_list(missing)}")
+    for (pinned, served), labels in sorted(drift.items()):
+        notes.append(f"brief pinned {pinned} but {served} served most requests on "
+                     f"{len(labels)} row(s): {name_list(labels)}")
+    if asked:
+        for model, where in sorted(asked.items()):
+            notes.append(f"requestedModel {model} on {name_list(where)}")
+    else:
+        notes.append("no requestedModel field on any request, so the requested model is "
+                     "unavailable; the served model comes from message.model")
+    if partial:
+        notes.append(f"thinking is a partial sum: {thin_responses} of {thin_total} responses "
+                     f"on {thin_rows} row(s) carried no thinking_tokens field "
+                     f"({name_list(partial)})")
+    if synthetic:
+        notes.append(f"<synthetic> responses, which no model served and none is billed: "
+                     f"{name_list(synthetic)}")
+    for reason, labels in sorted(unpriced.items()):
+        notes.append(f"{reason}, on {len(labels)} row(s)")
+    if not pricing_rates(cfg):
+        notes.append("no pricing rates configured; add them under pricing.models in the "
+                     "colony model config to get a cost")
+    return notes
+
+
+def report_json(sd, cfg, meta, rows, since):
+    """The report as data. A value is null where the source does not have it."""
+    block = cfg.get("pricing") or {}
+    out = {"colony": colony_name(), "root": meta.get("root") or project_root(),
+           "generated": now(), "since": since,
+           "pricing": {"units": block.get("units"), "models_with_rates": sorted(pricing_rates(cfg))},
+           "rows": [], "totals": None, "notes": report_notes(cfg, rows)}
+    grand = blank_usage()
+    for row in rows:
+        usage = row["usage"]
+        item = {k: row[k] for k in ("label", "kind", "task", "pinned_model",
+                                    "pinned_effort", "minutes", "since")}
+        if usage is None:
+            item.update({"session": None, "measured": False, "usage": None,
+                         "sub_agents": [], "cost": None})
+            out["rows"].append(item)
+            continue
+        cost, reasons = cost_estimate(cfg, usage["total"])
+        add_usage(grand, usage["total"])
+        item.update({"session": usage["session"], "transcript": usage["transcript"],
+                     "measured": True, "served_model": top_model(usage["total"]),
+                     "own": usage["own"], "total": usage["total"],
+                     "sub_agents": usage["subs"], "cost": cost,
+                     "cost_unavailable_because": reasons})
+        out["rows"].append(item)
+    cost, reasons = cost_estimate(cfg, grand)
+    out["totals"] = {"usage": grand, "cost": cost, "cost_unavailable_because": reasons,
+                     "measured_rows": sum(1 for r in rows if r["usage"]),
+                     "rows": len(rows)}
+    return out
+
+
+def cmd_report(a):
+    sd = state_dir()
+    note_master_session(sd)
+    cfg = models_config()
+    meta = load_json(os.path.join(sd, "colony.json"), {})
+    tasks = all_tasks(sd)
+    if not tasks:
+        # The same shape as a full report, so a reader needs no special case.
+        if a.json:
+            empty = report_json(sd, cfg, meta, [], None)
+            empty["notes"] = ["no tasks"]
+            print(json.dumps(empty, indent=1, default=str))
+        else:
+            print("no tasks")
+        return
+    rows, since = report_rows(sd, meta, tasks)
+    if a.json:
+        print(json.dumps(report_json(sd, cfg, meta, rows, since), indent=1, default=str))
+        return
+    print("task\tmodel\trequests\ttokens\tfirst context\tsub-agents\tminutes")
+    total = 0
+    for row in rows:
+        usage = row["usage"]
+        if row["kind"] == "worker":
+            if usage is None:
+                print(f"{row['task']}\t{short_model(row['pinned_model'])}\t-\t-\t-\t-\t{row['minutes']}")
+                continue
+            print(f"{row['task']}\t{short_model(top_model(usage['total']))}\t"
+                  f"{usage['total']['requests']}\t{fmt_k(usage['total']['tokens'])}\t"
+                  f"{fmt_k(usage['own']['first_context'])}\t"
+                  f"{fmt_k(usage['total']['tokens'] - usage['own']['tokens'])}\t{row['minutes']}")
+        else:
+            print(f"{row['label']} (since {row['since']})\t{short_model(top_model(usage['total']))}\t"
+                  f"{usage['total']['requests']}\t{fmt_k(usage['total']['tokens'])}\t-\t"
+                  f"{fmt_k(usage['total']['tokens'] - usage['own']['tokens'])}\t-")
+        total += usage["total"]["tokens"]
     print(f"total\t\t\t{fmt_k(total)}")
+    print()
+    print("where the tokens went")
+    print("row\tinput\toutput\tthinking\tcache read\tcache write 5m\tcache write 1h\tcost")
+    grand = blank_usage()
+    for row in rows:
+        usage = row["usage"]
+        if usage is None:
+            print(f"{row['label']}\t-\t-\t-\t-\t-\t-\t-")
+            continue
+        u = usage["total"]
+        add_usage(grand, u)
+        cost, _ = cost_estimate(cfg, u)
+        print(f"{row['label']}\t{fmt_k(u['input'])}\t{fmt_k(u['output'])}\t{fmt_thinking(u)}\t"
+              f"{fmt_k(u['cache_read'])}\t{fmt_k(u['cache_write_5m'])}\t"
+              f"{fmt_k(u['cache_write_1h'])}\t{fmt_cost(cost)}")
+    cost, _ = cost_estimate(cfg, grand)
+    print(f"total\t{fmt_k(grand['input'])}\t{fmt_k(grand['output'])}\t{fmt_thinking(grand)}\t"
+          f"{fmt_k(grand['cache_read'])}\t{fmt_k(grand['cache_write_5m'])}\t"
+          f"{fmt_k(grand['cache_write_1h'])}\t{fmt_cost(cost)}")
+    subs = [(row, sub) for row in rows if row["usage"] for sub in row["usage"]["subs"]]
+    if subs:
+        print()
+        print("sub-agents")
+        print("row\tagent type\trequests\ttokens\tdescription")
+        for row, sub in subs:
+            print(f"{row['label']}\t{sub['agent_type'] or '-'}\t{sub['requests']}\t"
+                  f"{fmt_k(sub['tokens'])}\t{(sub['description'] or '-')[:60]}")
+    efforts = blank_usage()
+    for row in rows:
+        if row["usage"]:
+            add_usage(efforts, row["usage"]["total"])
+    if efforts["efforts"] or efforts["per_turn_efforts"]:
+        print()
+        print("effort\trequests\tper-turn effort\trequests")
+        served = sorted(efforts["efforts"].items())
+        turn = sorted(efforts["per_turn_efforts"].items())
+        for i in range(max(len(served), len(turn))):
+            left = f"{served[i][0]}\t{served[i][1]}" if i < len(served) else "-\t-"
+            right = f"{turn[i][0]}\t{turn[i][1]}" if i < len(turn) else "-\t-"
+            print(f"{left}\t{right}")
+    notes = report_notes(cfg, rows)
+    if notes:
+        print()
+        print("notes")
+        for note in notes:
+            print(f"- {note}")
 
 
 def cmd_checkpoint(a):
@@ -821,6 +1182,7 @@ def main(argv=None):
     st.add_argument("--all", action="store_true", help="include closed tasks")
     st.set_defaults(func=cmd_status)
     r = sub.add_parser("report", help="tokens per worker and for the Master")
+    r.add_argument("--json", action="store_true", help="the whole report as JSON")
     r.set_defaults(func=cmd_report)
     ck = sub.add_parser("checkpoint", help="write the Master's state file; prints its path")
     ck.set_defaults(func=cmd_checkpoint)

@@ -219,5 +219,104 @@ echo "{\"timestamp\":\"2099-01-01T00:03:00Z\",\"requestId\":\"r4\",\"message\":{
 FAKE_SESSION=sess-456 run report;             check "report follows restart" 0 $rc "Master after restart 1" "$out"
 check "new session saved" 0 0 "sess-456" "$(cat "$SD/colony.json")"
 
+# Token ledger: a colony of its own, with crafted transcripts.
+# L1 holds a streamed duplicate, a response without the thinking field and a
+# <synthetic> response. L2 serves a model its brief did not pin and has a
+# sub-agent. L3's session has no transcript at all.
+model_effort_brief L1 claude-opus-4-8 high
+COLONY_NAME=led run start L1 L1.md;           check "ledger start L1" 0 $rc "started L1" "$out"
+FAKE_SESSION=sess-led COLONY_NAME=led run close L1;  check "ledger close L1" 0 $rc "session sess-led" "$out"
+model_effort_brief L2 claude-sonnet-5-5 low
+COLONY_NAME=led run start L2 L2.md;           check "ledger start L2" 0 $rc "started L2" "$out"
+FAKE_SESSION=sess-l2 COLONY_NAME=led run close L2;   check "ledger close L2" 0 $rc "session sess-l2" "$out"
+model_effort_brief L3 claude-opus-4-8 low
+COLONY_NAME=led run start L3 L3.md;           check "ledger start L3" 0 $rc "started L3" "$out"
+FAKE_SESSION=sess-gone COLONY_NAME=led run close L3; check "ledger close L3" 0 $rc "session sess-gone" "$out"
+
+mkdir -p "$T/claude/projects/x/sess-l2/subagents"
+c1='"cache_creation":{"ephemeral_1h_input_tokens":4000,"ephemeral_5m_input_tokens":1000}'
+{
+  echo "{\"timestamp\":\"2099-01-01T00:00:00Z\",\"requestId\":\"q1\",\"effort\":\"high\",\"perTurnEffort\":\"high\",\"message\":{\"id\":\"n1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":20000,\"cache_creation_input_tokens\":5000,$c1,\"output_tokens\":500,\"output_tokens_details\":{\"thinking_tokens\":300}}}}"
+  echo "{\"timestamp\":\"2099-01-01T00:00:01Z\",\"requestId\":\"q1\",\"effort\":\"high\",\"perTurnEffort\":\"high\",\"message\":{\"id\":\"n1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":20000,\"cache_creation_input_tokens\":5000,$c1,\"output_tokens\":1500,\"output_tokens_details\":{\"thinking_tokens\":900}}}}"
+  echo "{\"timestamp\":\"2099-01-01T00:01:00Z\",\"requestId\":\"q2\",\"effort\":\"high\",\"message\":{\"id\":\"n2\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":30000,\"cache_creation_input_tokens\":0,\"output_tokens\":200}}}"
+  echo "{\"timestamp\":\"2099-01-01T00:02:00Z\",\"requestId\":\"q3\",\"message\":{\"id\":\"n3\",\"model\":\"<synthetic>\",\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":10}}}"
+} > "$T/claude/projects/x/sess-led.jsonl"
+echo "{\"timestamp\":\"2099-01-01T00:03:00Z\",\"requestId\":\"q4\",\"message\":{\"id\":\"n4\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":10000,\"cache_creation_input_tokens\":0,\"output_tokens\":100}}}" > "$T/claude/projects/x/sess-l2.jsonl"
+echo "{\"timestamp\":\"2099-01-01T00:04:00Z\",\"requestId\":\"q5\",\"message\":{\"id\":\"n5\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":2000,\"cache_creation_input_tokens\":0,\"output_tokens\":50,\"output_tokens_details\":{\"thinking_tokens\":20}}}}" > "$T/claude/projects/x/sess-l2/subagents/agent-a.jsonl"
+echo '{"agentType":"general-purpose","description":"Review L2 against criteria"}' > "$T/claude/projects/x/sess-l2/subagents/agent-a.meta.json"
+
+COLONY_NAME=led run report
+check "ledger keeps the old table" 0 $rc "L1	opus-4-8	3	57k	25k	0k" "$out"
+check "ledger counts a sub-agent" 0 0 "L2	opus-5-5	2	12k	10k	2k" "$out"
+check "no transcript stays blank" 0 0 "L3	opus-4-8	-	-	-	-" "$out"
+check "ledger breakdown header" 0 0 "row	input	output	thinking	cache read	cache write 5m	cache write 1h	cost" "$out"
+check "ledger breakdown row" 0 0 "L1	0k	2k	1k	50k	1k	4k	-" "$out"
+check "sub-agent type and description" 0 0 "L2	general-purpose	1	2k	Review L2 against criteria" "$out"
+check "effort per request" 0 0 "high	2" "$out"
+check "drift noted" 0 0 "brief pinned claude-sonnet-5-5 but claude-opus-5-5 served most requests on 1 row(s): L2" "$out"
+check "missing transcript noted" 0 0 "no transcript found for 1 row(s), so their usage is unavailable, not zero: L3" "$out"
+check "partial thinking noted" 0 0 "carried no thinking_tokens field (L1, L2" "$out"
+check "synthetic noted" 0 0 "<synthetic> responses, which no model served and none is billed: L1 x1" "$out"
+check "no rates noted" 0 0 "no pricing rates configured" "$out"
+absent "no invented cache-read split" "cache read 1h" "$out"
+
+COLONY_NAME=led run report --json
+check "json parses" 0 $rc '"colony": "led"' "$out"
+jrc=0; python3 -c 'import json,sys; json.load(sys.stdin)' <<<"$out" >/dev/null 2>&1 || jrc=$?
+check "json is valid JSON" 0 $jrc "" ""
+check "json input" 0 0 '"input": 100' "$out"
+check "json output" 0 0 '"output": 1710' "$out"
+check "json thinking is not added to output" 0 0 '"thinking": 900' "$out"
+check "json thinking unknown" 0 0 '"thinking_unknown": 2' "$out"
+check "json cache read" 0 0 '"cache_read": 50000' "$out"
+check "json cache write" 0 0 '"cache_write": 5000' "$out"
+check "json cache write 1h" 0 0 '"cache_write_1h": 4000' "$out"
+check "json cache write 5m" 0 0 '"cache_write_5m": 1000' "$out"
+check "json tokens" 0 0 '"tokens": 56810' "$out"
+check "json first context" 0 0 '"first_context": 25100' "$out"
+check "json sub-agent type" 0 0 '"agent_type": "general-purpose"' "$out"
+check "json unmeasured row" 0 0 '"measured": false' "$out"
+check "json cost is unavailable" 0 0 '"cost": null' "$out"
+check "json pricing units" 0 0 '"units": "USD per million tokens"' "$out"
+absent "json invents no cache-read 1h" "cache_read_1h" "$out"
+absent "json invents no cache-read 5m" "cache_read_5m" "$out"
+COLONY_NAME=fresh run report --json;          check "json with no tasks" 0 $rc '"no tasks"' "$out"
+
+# Pricing: rates in the config, partial rates, a config without the block, bad blocks.
+price() { # rates for claude-opus-4-8 -> $T/price.json
+  python3 - "$1" <<'PY'
+import json, os, sys
+cfg = json.load(open(os.environ["REPO_CONFIG"]))
+cfg["pricing"] = {"units": "USD per million tokens", "models": {"claude-opus-4-8": json.loads(sys.argv[1])}}
+json.dump(cfg, open(os.path.join(os.environ["T"], "price.json"), "w"))
+PY
+}
+export REPO_CONFIG="$HERE/../colony-models.json" T="$T"
+price '{"input":15,"output":75,"cache_read":1.5,"cache_write_1h":30,"cache_write_5m":18.75}'
+COLONY_MODELS_CONFIG="$T/price.json" COLONY_NAME=led run report
+check "cost from rates" 0 $rc "L1	0k	2k	1k	50k	1k	4k	0.34" "$out"
+check "cost of a priced sub-agent" 0 0 "L2	0k	0k	0k	12k	0k	0k	0.01" "$out"
+check "unpriced model named" 0 0 "claude-opus-5-5: no rate in the pricing config" "$out"
+check "synthetic not priced" 0 0 "<synthetic>: not a served model, not priced" "$out"
+price '{"input":15}'
+COLONY_MODELS_CONFIG="$T/price.json" COLONY_NAME=led run report
+check "partial rates give no cost" 0 $rc "L1	0k	2k	1k	50k	1k	4k	-" "$out"
+check "partial rates say which" 0 0 "no rate for output, cache_read, cache_write_1h, cache_write_5m" "$out"
+python3 -c "
+import json, os
+cfg = json.load(open(os.environ['REPO_CONFIG'])); cfg.pop('pricing', None)
+json.dump(cfg, open(os.path.join(os.environ['T'], 'nopricing.json'), 'w'))"
+COLONY_MODELS_CONFIG="$T/nopricing.json" COLONY_NAME=led run report
+check "config without pricing still works" 0 $rc "no pricing rates configured" "$out"
+echo '{"banned":[],"worker_models":["m"],"master_model":"m","reviewer_model":"m","efforts":["low"],"pricing":{"models":{"m":{"bogus":1}}}}' > "$T/badprice.json"
+COLONY_MODELS_CONFIG="$T/badprice.json" COLONY_NAME=led run report
+check "unknown rate name refused" 2 $rc "name bogus; use input, output, cache_read" "$out"
+echo '{"banned":[],"worker_models":["m"],"master_model":"m","reviewer_model":"m","efforts":["low"],"pricing":{"models":{"m":{"input":-1}}}}' > "$T/badprice.json"
+COLONY_MODELS_CONFIG="$T/badprice.json" COLONY_NAME=led run report
+check "negative rate refused" 2 $rc "not negative" "$out"
+echo '{"banned":[],"worker_models":["m"],"master_model":"m","reviewer_model":"m","efforts":["low"],"pricing":[]}' > "$T/badprice.json"
+COLONY_MODELS_CONFIG="$T/badprice.json" COLONY_NAME=led run report
+check "bad pricing block refused" 2 $rc "must be an object with a models object" "$out"
+
 echo "colony tests: $pass passed, $fail failed"
 [[ $fail = 0 ]]

@@ -182,8 +182,50 @@ The diagram at the top shows two tasks, one of which asks a question. For one ta
    pane. The transcript stays and can be resumed.
 
 `colony wait` also reports a worker whose pane is gone (LOST) and one that
-stopped without reporting (IDLE). `colony report` counts tokens per worker and
-for the Master. `colony status` shows one line per task.
+stopped without reporting (IDLE). `colony status` shows one line per task.
+`colony report` counts tokens per worker and for the Master; the next section
+says what it measures.
+
+### What `colony report` measures
+
+`colony report` reads each session's transcript and counts one row per worker
+and per Master session. The first table is the one it always had: requests,
+tokens, the first request's context, sub-agent tokens and minutes. Below it
+come four more blocks:
+
+- where the tokens went: input, output, thinking, cache reads, and cache writes
+  split into their 5-minute and 1-hour kinds;
+- one row per sub-agent, with the agent type and description from its
+  `agent-<id>.meta.json`;
+- the efforts the requests ran at, as served and per turn;
+- notes: the model a brief pinned against the model that served it, the fields
+  the transcripts do not carry, and the models with no price.
+
+`colony report --json` prints the same report as data, with `null` where a
+source has no value.
+
+A response appears several times in a transcript while it streams. Within one
+message and request id the input and cache counts stay the same. The output and
+thinking counts only grow. So each response counts once, with its largest
+output. Thinking tokens are part of output, not an addition to it. The
+1-hour and 5-minute split belongs to cache writes; cache reads carry no such
+split and the report invents none.
+
+Three things the transcripts do not give:
+
+- `requestedModel` is on 910 of 31,318 archived responses, so what was asked
+  for is usually unavailable. The report compares the brief's pinned model with
+  the model that served the requests instead.
+- No agent type is called "reviewer", so a worker's bounded reviewer cannot be
+  told apart from its other sub-agents. The report prints each sub-agent's type
+  and description and leaves the reading to you.
+- 2,094 of 31,318 responses carry no thinking field. There thinking is missing,
+  not zero, and the report says so.
+
+A cost needs rates. `colony-models.json` holds an optional `pricing` block, and
+colony ships it empty: fill it from the vendor's current price list. A model is
+priced only when every category it used has a rate, so the report shows no cost
+rather than a low one.
 
 ### Outcomes and events
 
@@ -220,6 +262,7 @@ project apart; workers inherit it.
 | The Master restart is opt-in | It saves context, but the Master loses its conversation history, which the user values | Auto-compact the Master below 600k | the design decision |
 | Masters compact at 600k, other sessions at 800k | Every Master request carries its context, and its state lives in files (plan, ledger, event log, briefs). Other sessions keep more detail, at about 30% more tokens per hour once past 600k (estimated) | One window for every session; Masters at 200k | the design decision, 2026-10-06 |
 | Every brief pins a model and an effort; the policy lives in `colony-models.json`, and Opus 5.5 and Fable are banned | Opus 5.5 drained the user's tokens, so each worker should run the cheapest model that can pass. A pinned id, not a floating alias, keeps a worker off a banned or costlier model. One config file holds the policy, for a fork to set its own. Tests and an Opus 4.8 reviewer catch a cheaper worker's mistakes | A bare `opus` default; the Master picks any model; a hardcoded policy in the code | the design decision, 2026-10-08 |
+| `colony report` counts each token category, and prices them only from configured rates | One raw total hides that almost all of it is cache reads, which are priced apart from fresh input. Rates change and differ per plan, so a built-in price would be a guess | One token total; prices in the code | measured, 2026-10-11 |
 | Workers are sessions, not sub-agents | A sub-agent's result enters the Master's context, a background one starts a Master turn, and a sub-agent cannot ask the user (see [Workers are not sub-agents](#workers-are-not-sub-agents)) | Sub-agents started by the Master's Agent tool, in the foreground or the background | this page |
 | Herdr panes | The user works in Herdr, and a worker can ask the user in its own pane | Agent teams: experimental and they cannot use Herdr panes. Headless `claude -p`: cannot ask the user and is not visible. OpenRig: did not meet the requirements | the OpenRig spike |
 | State outside the project | The colony must not change project files; each project decides its own ledger | A ledger file in each repo | the design decision |
@@ -258,7 +301,8 @@ the Master checks facts at their source.
 | LIVE1: one worker, one-step task | 2026-10-06 | Every step worked. 5 requests, 194k tokens | measured |
 | Benchmark: a new Master and three parallel workers on a research question | 2026-10-06 | Every step worked, including a question, three PASS outcomes, the Master's checks and a restart. 291 requests, 37.8M tokens, about 130k a request. Workers started at 38k | measured |
 | The same 291 requests at the old median context sizes | 2026-10-06 | About 185M tokens, about 5 times as much | estimated, same benchmark |
-| Tests | 2026-10-08 | 95 cases pass against a fake Herdr | `bash tests/colony.sh` |
+| Tests | 2026-10-11 | 143 cases pass against a fake Herdr | `bash tests/colony.sh` |
+| The ledger against the archive | 2026-10-11 | 98 sessions (86 workers, 12 Masters) and their 144 sub-agent transcripts: a second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught | measured, `python3 tests/archive-check.py` |
 
 The benchmark found two faults in `colony report`, both fixed: it undercounted
 output tokens, and it missed the Master's session after a restart.
@@ -268,10 +312,14 @@ output tokens, and it missed the Master's session after a restart.
 - Only a research task was benchmarked. A coding task with tests was not.
 - The effect of a cheaper worker model on the plan limits is not measured yet.
   `colony report` shows each worker's model and effort.
-- Savings are counted in raw tokens. How the plan limits weigh cache reads
-  against other tokens is not published; outside reports range from 0 to 1
-  times a fresh input token.
-  Report savings both raw and weighted by API price.
+- `colony report` counts each token category, and a cost once the pricing block
+  holds rates. How the plan limits weigh cache reads against other tokens is
+  still not published. Outside reports range from 0 to 1 times a fresh input
+  token. So a price-weighted figure is not a plan-limit figure.
+- A worker's reviewer cannot be told from its other sub-agents, because no
+  agent type is called "reviewer". Reviewer cost is not separated.
+- `colony report` looks for transcripts under `CLAUDE_CONFIG_DIR`. A session
+  that ran with another config directory reports as unmeasured.
 - A background command stops after 30 minutes unless its Bash call sets a
   longer timeout (Claude Code 2.1.287). `colony wait` stops at 1,700 seconds
   by default, and the Master runs it again.
@@ -291,6 +339,7 @@ user set this on 2026-10-07.
 | What changes | Where | What else to do |
 |---|---|---|
 | Behaviour of a command | `colony.py` | Add a case to `tests/colony.sh`, see it fail first, then pass |
+| What `colony report` counts | `colony.py` | Add a case to `tests/colony.sh`, then run `python3 tests/archive-check.py` against the real transcripts |
 | The worker prompt, brief template or checkpoint text (`PROMPT`, `BRIEF_TEMPLATE`, `CHECKPOINT_TEMPLATE`, `RESUME_PROMPT`) | `colony.py` | Use your own review process before changing text that steers workers, then get the user's approval |
 | The worker model policy | `colony-models.json` | Edit the config, not the code; `COLONY_MODELS_CONFIG` overrides its path |
 | A design decision | A new dated section in the History table below | Update this page and its decision table |
@@ -304,7 +353,11 @@ the model policy, so a fork sets its own in one file. Its keys are:
   `claude-haiku-4-5-20251001`);
 - `banned`: `claude-opus-5-5` and `claude-fable-5-1`;
 - `master_model` and `reviewer_model`: both `claude-opus-4-8`;
-- `efforts`: `low`, `medium`, `high`, `xhigh`, `max`.
+- `efforts`: `low`, `medium`, `high`, `xhigh`, `max`;
+- `pricing` (optional): `units`, and a `models` map of rates per million
+  tokens. A rate set may name `input`, `output`, `cache_read`,
+  `cache_write_1h` and `cache_write_5m`. A config without the block stays
+  valid, and colony ships the block empty.
 
 It is read through the real script path, so it works through the
 `~/.local/bin/colony` symlink; `COLONY_MODELS_CONFIG` overrides the path.
@@ -326,6 +379,7 @@ work.
 | 2026-10-07 | A brief-template line for a later verifier's checks, added and reverted the same day: its evidence came from one project | the design decision |
 | 2026-10-08 | A brief may pin Opus 4.8 with `claude-opus-4-8`; `opus` still means the newest Opus | the design decision |
 | 2026-10-08 | Every brief pins a model and an effort; the policy moves to `colony-models.json`; bare aliases dropped; Opus 5.5 and Fable banned; the reviewer runs `claude-opus-4-8` | the design decision |
+| 2026-10-11 | `colony report` counts input, output, thinking, cache reads and both cache writes, adds a row for each sub-agent, flags the pinned model against the served one, prices from an optional config block, and prints `--json` | the design decision |
 
 ## Where to go next
 
