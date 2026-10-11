@@ -302,6 +302,7 @@ colony adds no revision to it.
 | Every brief pins a model and an effort; the policy lives in `colony-models.json`, and Opus 5.5 and Fable are banned | Opus 5.5 drained the user's tokens, so each worker should run the cheapest model that can pass. A pinned id, not a floating alias, keeps a worker off a banned or costlier model. One config file holds the policy, for a fork to set its own. Tests and an Opus 4.8 reviewer catch a cheaper worker's mistakes | A bare `opus` default; the Master picks any model; a hardcoded policy in the code | the design decision, 2026-10-08 |
 | `colony report` counts each token category, and prices them only from configured rates | One raw total hides that almost all of it is cache reads, which are priced apart from fresh input. Rates change and differ per plan, so a built-in price would be a guess | One token total; prices in the code | measured, 2026-10-11 |
 | A task records its revision, dirty flag, verdict and retried task | None of the four can be read back later: the tree moves on, and a worker's PASS is not the Master's verdict. Tokens for each accepted task cannot be counted without them | Read the revision from the transcript's `gitBranch`; take a PASS as acceptance | the design decision, 2026-10-11 |
+| A worker's tool output is left as it is | A size rule could reach 10% to 15% of what enters a context, because the mass sits in thousands of small results, not in a few large ones. The instruction already loads into every worker from `CLAUDE.md`, and the archive shows it does not produce the behaviour. Proving an 8% saving needs about 49 paired runs, near 1 billion tokens, and the change could save about 349 million across the whole archive | A sentence in the worker prompt telling a worker to read ranges and filter output; a size threshold on command output | measured, `~/.local/state/claude-system/reviews/colony-burn-2026-10-11/` |
 | Workers are sessions, not sub-agents | A sub-agent's result enters the Master's context, a background one starts a Master turn, and a sub-agent cannot ask the user (see [Workers are not sub-agents](#workers-are-not-sub-agents)) | Sub-agents started by the Master's Agent tool, in the foreground or the background | this page |
 | Herdr panes | The user works in Herdr, and a worker can ask the user in its own pane | Agent teams: experimental and they cannot use Herdr panes. Headless `claude -p`: cannot ask the user and is not visible. OpenRig: did not meet the requirements | the OpenRig spike |
 | State outside the project | The colony must not change project files; each project decides its own ledger | A ledger file in each repo | the design decision |
@@ -341,7 +342,8 @@ the Master checks facts at their source.
 | Benchmark: a new Master and three parallel workers on a research question | 2026-10-06 | Every step worked, including a question, three PASS outcomes, the Master's checks and a restart. 291 requests, 37.8M tokens, about 130k a request. Workers started at 38k | measured |
 | The same 291 requests at the old median context sizes | 2026-10-06 | About 185M tokens, about 5 times as much | estimated, same benchmark |
 | Tests | 2026-10-11 | 196 cases pass against a fake Herdr | `bash tests/colony.sh` |
-| The ledger against the archive | 2026-10-11 | 98 sessions (86 workers, 12 Masters) and their 144 sub-agent transcripts: a second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught | measured, `python3 tests/archive-check.py` |
+| The archive burn analysis | 2026-10-11 | 3.49 billion tokens over every colony run to then. Cache reads were 98.0% of them. Material entered a context 52.3 million times and was read back 3.42 billion times, a re-read factor of 65.4. Command output supplied 65% of what entered a context and file reads 17% | measured, `~/.local/state/claude-system/reviews/colony-burn-2026-10-11/` |
+| The ledger against the archive | 2026-10-11 | Every session recorded by then: 100 of them, 90 workers and 10 Masters, with 147 sub-agent transcripts. A second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught. The archive grows, so run the command again for today's counts | measured, `python3 tests/archive-check.py` |
 
 The benchmark found two faults in `colony report`, both fixed: it undercounted
 output tokens, and it missed the Master's session after a restart.
@@ -374,6 +376,11 @@ output tokens, and it missed the Master's session after a restart.
   row and a pane that is not waiting for input.
 - Across two separate `colony wait` runs the count starts again, so a worker
   that stays idle can be reported more than once. Each report is true.
+- A `colony` command run outside a Git repository keys its state on the
+  working directory instead of a project root. One colony in the archive was
+  made that way, holds no task, and lists a Master session that another colony
+  also lists. `tests/archive-check.py` reconciles each session once and names
+  both listings.
 - One reader per colony: only the Master runs `colony wait`.
 - A Master outside Herdr cannot run a colony.
 - Workers start in the permission mode from settings, `bypassPermissions`.
@@ -431,6 +438,7 @@ work.
 | 2026-10-11 | `colony report` counts input, output, thinking, cache reads and both cache writes, adds a row for each sub-agent, flags the pinned model against the served one, prices from an optional config block, and prints `--json` | the design decision |
 | 2026-10-11 | A task records `revision`, `dirty`, `verdict` and `retry_of`; `colony close` takes `--accept`, `--reject` or `--partial`, and `colony start` takes `--retry-of` | the design decision |
 | 2026-10-11 | IDLE needs three checks in a row and a pane that is not waiting for input, after all 10 archived IDLE events proved premature | measured |
+| 2026-10-11 | The archive burn analysis; the plan to bound a worker's tool output was closed without a benchmark, because the reachable material is 10% to 15% and the proof costs more than the saving | measured |
 
 ## Where to go next
 

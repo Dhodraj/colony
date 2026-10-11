@@ -109,8 +109,24 @@ def recount(path, since=None):
 
 
 def sessions(home):
-    """(role, label, session id) for every session the colonies recorded."""
-    found = []
+    """({session id: {"role", "labels"}}, listings, colonies without a task).
+
+    One session can be listed more than once. A Master that runs a colony
+    command outside a Git repository gets a second colony keyed on that
+    directory, and the same session id is then listed in both colony.json
+    files. Reconciling it twice would count its transcript and its sub-agents
+    twice, so each session id appears here once and keeps every place it was
+    listed.
+    """
+    found = collections.OrderedDict()
+
+    def note(session, role, label):
+        entry = found.setdefault(session, {"role": role, "labels": []})
+        entry["labels"].append(label)
+        if entry["role"] != role:
+            entry["role"] = "worker and master"
+
+    listings = 0
     for path in sorted(glob.glob(os.path.join(home, "*", "*", "tasks", "*.json"))):
         try:
             with open(path, encoding="utf-8") as f:
@@ -118,33 +134,51 @@ def sessions(home):
         except (OSError, json.JSONDecodeError):
             continue
         if task.get("session"):
-            found.append(("worker", task.get("id", "?"), task["session"]))
+            listings += 1
+            colony = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            note(task["session"], "worker", f"{colony}/{task.get('id', '?')}")
+    empty = []
     for path in sorted(glob.glob(os.path.join(home, "*", "*", "colony.json"))):
         try:
             with open(path, encoding="utf-8") as f:
                 meta = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        name = meta.get("name") or "?"
+        state = os.path.dirname(path)
+        if not glob.glob(os.path.join(state, "tasks", "*.json")):
+            empty.append((os.path.relpath(state, home), meta.get("root")))
+        # Two colonies can both be called "main", so the label carries the
+        # project the state directory was keyed on.
+        name = meta.get("name") or os.path.basename(state)
+        project = os.path.basename(os.path.dirname(state))[-28:]
         for i, session in enumerate(meta.get("master_sessions")
                                     or [meta.get("master_session")]):
             if session:
-                found.append(("master", f"{name} Master {i}", session))
-    return found
+                listings += 1
+                note(session, "master", f"{project}/{name} Master {i}")
+    return found, listings, empty
 
 
 def main():
     colony = load_colony()
     home = os.environ.get("COLONY_HOME") or os.path.expanduser(
         "~/.local/state/claude-system/colony")
-    targets = sessions(home)
+    targets, listings, empty = sessions(home)
     if not targets:
         print(f"no session recorded under {home}", file=sys.stderr)
         return 2
+    print(f"sessions listed {listings}, distinct {len(targets)}")
+    for session, entry in targets.items():
+        if len(entry["labels"]) > 1:
+            print(f"  listed {len(entry['labels'])} times, reconciled once: "
+                  f"{session[:8]} as {', '.join(entry['labels'])}")
+    for state, root in empty:
+        print(f"  colony with no task: {state} (root {root})")
     reconciled = absent = differences = 0
     subs = collections.Counter()
     variants = collections.Counter()
-    for role, label, session in targets:
+    for session, entry in targets.items():
+        role, label = entry["role"], entry["labels"][0]
         usage = colony.session_usage(session)
         if usage is None:
             absent += 1
