@@ -15,6 +15,9 @@ echo "$*" >> "$FAKE_LOG"
 case "$1 $2" in
   "pane split") echo "{\"result\":{\"pane\":{\"pane_id\":\"w9:p$(( $(grep -c 'pane split' "$FAKE_LOG") + 6 ))\"}}}" ;;
   "agent start")
+    if [[ "${FAKE_START_BROKEN:-0}" = 1 ]]; then
+      echo '{"error":{"code":"internal","message":"herdr exploded"}}'; exit 1
+    fi
     if [[ "${FAKE_START_FAIL:-0}" = 1 ]]; then
       echo '{"error":{"code":"agent_not_ready","message":"agent not ready"}}'; exit 1
     fi
@@ -24,7 +27,7 @@ case "$1 $2" in
     if [[ "${FAKE_AGENT_GONE:-0}" = 1 ]]; then
       echo "{\"error\":{\"code\":\"agent_not_found\",\"message\":\"agent target $3 not found\"}}"; exit 1
     fi
-    echo "{\"result\":{\"agent\":{\"agent_status\":\"${FAKE_STATUS:-working}\"}}}" ;;
+    echo "{\"result\":{\"agent\":{\"agent_status\":\"${FAKE_STATUS:-working}\",\"agent_session\":{\"value\":\"${FAKE_AGENT_SESSION:-}\"}}}}" ;;
   "pane get") echo "{\"result\":{\"pane\":{\"agent_status\":\"${FAKE_PANE_STATUS:-${FAKE_STATUS:-idle}}\",\"agent_session\":{\"value\":\"${FAKE_SESSION:-sess-123}\"}}}}" ;;
   "pane close") echo '{"result":{}}' ;;
   *) echo '{"error":{"message":"unknown"}}'; exit 1 ;;
@@ -34,6 +37,7 @@ chmod +x "$T/herdr"
 
 export COLONY_HERDR="$T/herdr" COLONY_HOME="$T/state" FAKE_LOG="$T/calls.log"
 export COLONY_CHECK_EVERY=0.2 COLONY_SETTLE=0.1 HERDR_ENV=1 HERDR_PANE_ID=w9:p1
+export COLONY_START_READY_WAIT=0.5
 export CLAUDE_CONFIG_DIR="$T/claude"
 unset COLONY_NAME CLAUDE_CODE_AUTO_COMPACT_WINDOW
 mkdir -p "$T/proj" "$T/results" "$T/claude/projects/x/sess-123/subagents"
@@ -421,6 +425,24 @@ brief ID3
 COLONY_NAME=idlecheck run start ID3 ID3.md
 FAKE_AGENT_GONE=1 COLONY_NAME=idlecheck run wait --timeout 2
 check "a lost worker is still found at once" 0 $rc "ID3	LOST" "$out"
+
+# An agent herdr calls not ready, which becomes ready, is used rather than lost.
+brief NR1
+FAKE_START_FAIL=1 FAKE_AGENT_SESSION=sess-ready run start NR1 NR1.md
+check "a late-ready agent is used" 0 $rc "started NR1" "$out"
+check "the recovery is reported" 0 0 "became ready and was used anyway" "$out"
+check "the late-ready agent is prompted" 0 0 "agent prompt w-nr1" "$(grep 'agent prompt w-nr1' "$FAKE_LOG")"
+check "the late-ready task is recorded" 0 0 "NR1	STARTED" "$(cat "$SD/events.log")"
+check "the late-ready task has state" 0 0 '"id": "NR1"' "$(cat "$SD/tasks/NR1.json")"
+# An agent that never reports a session is still a failed start.
+brief NR2
+FAKE_START_FAIL=1 run start NR2 NR2.md;       check "a never-ready agent fails" 1 $rc "agent not ready" "$out"
+check "the failed start is recorded" 0 0 "NR2	START-FAILED" "$(cat "$SD/events.log")"
+absent "the failed start leaves no task" "NR2" "$(ls "$SD/tasks")"
+# Any other start error fails at once, with no waiting.
+brief NR3
+FAKE_START_BROKEN=1 run start NR3 NR3.md;     check "another start error still fails" 1 $rc "herdr exploded" "$out"
+absent "no readiness wait for another error" "became ready" "$out"
 
 echo "colony tests: $pass passed, $fail failed"
 [[ $fail = 0 ]]

@@ -114,6 +114,7 @@ Edit the config, not the code, to set your own policy.
 | `COLONY_MODELS_CONFIG` | next to the script | Path to the model-policy config, overriding the default location |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps session transcripts. Colony reads them for `colony report` and the Master-model warning |
 | `COLONY_CHECK_EVERY` | `60` | Seconds between worker health checks during `colony wait` |
+| `COLONY_START_READY_WAIT` | `120` | Seconds `colony start` waits for a worker agent that Herdr reports as not ready. It gives up only if the agent never reports a session |
 | `COLONY_IDLE_SAMPLES` | `3` | Health checks in a row that must find a worker idle, with a pane that is not waiting for input, before `colony wait` reports IDLE |
 | `COLONY_SETTLE` | `3` | Seconds `colony wait` waits to collect outcomes that arrive together |
 
@@ -124,7 +125,7 @@ bash tests/colony.sh
 ```
 
 The tests run colony against a fake `herdr`, so they need no real Herdr. There
-are 196 cases.
+are 206 cases.
 
 ```sh
 python3 tests/archive-check.py

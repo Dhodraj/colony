@@ -66,6 +66,8 @@ SETTLE = float(os.environ.get("COLONY_SETTLE", 3))
 # Checks in a row that must find a worker idle before IDLE is reported. The
 # checks are CHECK_EVERY apart, so three of them is about three minutes.
 IDLE_SAMPLES = max(1, int(os.environ.get("COLONY_IDLE_SAMPLES", 3)))
+# Seconds to keep waiting for a worker agent that herdr says is not ready yet.
+START_READY_WAIT = float(os.environ.get("COLONY_START_READY_WAIT", 120))
 CHECKPOINT_FRESH = 15 * 60  # restart needs a checkpoint written this recently
 MASTER_WINDOW = "600000"  # Masters compact earlier than other sessions (record 0005)
 
@@ -512,6 +514,41 @@ def master_last_model(meta):
     return last
 
 
+def agent_session_of(name):
+    """The worker agent's session id, or None when it has none yet."""
+    try:
+        info = herdr("agent", "get", name)
+    except ColonyError:
+        return None
+    agent = (info.get("result") or {}).get("agent") or {}
+    return (agent.get("agent_session") or {}).get("value")
+
+
+def wait_ready(name, seconds):
+    """Wait up to `seconds` for a worker agent to report a session id.
+
+    `herdr agent start` can fail for an agent that is only still starting.
+    Measured on 2026-10-12: a start with a 150-second timeout returned
+    agent_not_ready while the pane already held a running Claude session, and
+    the agent reported idle with a session id seconds later. Closing the pane
+    on that error throws away a worker that would have worked, which is what
+    the archive's 6 START-FAILED events were.
+
+    The error is recognised by its message text, because `herdr` reports the
+    code only inside the payload this script discards. A wording change
+    upstream turns the recovery off, not into a wrong outcome.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        session = agent_session_of(name)
+        if session:
+            return session
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        time.sleep(max(0.05, min(2, left)))
+
+
 def cmd_start(a):
     task_id = check_id(a.id)
     brief = os.path.abspath(a.brief)
@@ -564,7 +601,15 @@ def cmd_start(a):
                  "--timeout", "60000", "--", "--name", title,
                  "--exclude-dynamic-system-prompt-sections",
                  "--model", model, "--effort", effort]
-        herdr(*start)
+        try:
+            herdr(*start)
+        except ColonyError as e:
+            if "not ready" not in str(e):
+                raise
+            if not wait_ready(name, START_READY_WAIT):
+                raise
+            print(f"warning: herdr said {name} was not ready; it became ready and was "
+                  f"used anyway", file=sys.stderr)
         herdr("agent", "prompt", name,
               PROMPT.format(id=task_id, brief=brief, reviewer_model=models_config()["reviewer_model"]))
     except ColonyError as e:

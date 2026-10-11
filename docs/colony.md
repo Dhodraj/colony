@@ -160,6 +160,8 @@ The diagram at the top shows two tasks, one of which asks a question. For one ta
    beside the Master (later workers stack below the first) and starts Claude
    there on the brief's model and effort. Then it sends the worker prompt.
    `--model` and `--effort` override the brief and are validated the same way.
+   If Herdr reports the agent as not ready, `colony start` waits for it to
+   report a session before giving up; see the limits below.
    The brief's
    model and effort go into the task JSON and the STARTED event, and
    `colony report` shows them. The prompt names the brief and the steps the
@@ -341,7 +343,7 @@ the Master checks facts at their source.
 | LIVE1: one worker, one-step task | 2026-10-06 | Every step worked. 5 requests, 194k tokens | measured |
 | Benchmark: a new Master and three parallel workers on a research question | 2026-10-06 | Every step worked, including a question, three PASS outcomes, the Master's checks and a restart. 291 requests, 37.8M tokens, about 130k a request. Workers started at 38k | measured |
 | The same 291 requests at the old median context sizes | 2026-10-06 | About 185M tokens, about 5 times as much | estimated, same benchmark |
-| Tests | 2026-10-11 | 196 cases pass against a fake Herdr | `bash tests/colony.sh` |
+| Tests | 2026-10-12 | 206 cases pass against a fake Herdr | `bash tests/colony.sh` |
 | The archive burn analysis | 2026-10-11 | 3.49 billion tokens over every colony run to then. Cache reads were 98.0% of them. Material entered a context 52.3 million times and was read back 3.42 billion times, a re-read factor of 65.4. Command output supplied 65% of what entered a context and file reads 17% | measured, `~/.local/state/claude-system/reviews/colony-burn-2026-10-11/` |
 | The ledger against the archive | 2026-10-11 | Every session recorded by then: 100 of them, 90 workers and 10 Masters, with 147 sub-agent transcripts. A second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught. The archive grows, so run the command again for today's counts | measured, `python3 tests/archive-check.py` |
 
@@ -376,6 +378,12 @@ output tokens, and it missed the Master's session after a restart.
   row and a pane that is not waiting for input.
 - Across two separate `colony wait` runs the count starts again, so a worker
   that stays idle can be reported more than once. Each report is true.
+- `herdr agent start` sometimes reports that a worker agent is not ready when the
+  agent is only still starting. Measured on 2026-10-12: a start with a 150-second
+  timeout failed while the pane already held a running session. The agent
+  reported a session id seconds later. So `colony start` waits for the agent to
+  report a session before it gives up. `COLONY_START_READY_WAIT` sets how long. A
+  start that fails for any other reason still fails at once.
 - A `colony` command run outside a Git repository keys its state on the
   working directory instead of a project root. One colony in the archive was
   made that way, holds no task, and lists a Master session that another colony
@@ -439,6 +447,7 @@ work.
 | 2026-10-11 | A task records `revision`, `dirty`, `verdict` and `retry_of`; `colony close` takes `--accept`, `--reject` or `--partial`, and `colony start` takes `--retry-of` | the design decision |
 | 2026-10-11 | IDLE needs three checks in a row and a pane that is not waiting for input, after all 10 archived IDLE events proved premature | measured |
 | 2026-10-11 | The archive burn analysis; the plan to bound a worker's tool output was closed without a benchmark, because the reachable material is 10% to 15% and the proof costs more than the saving | measured |
+| 2026-10-12 | `colony start` waits for an agent Herdr calls not ready, after a live start failed on an agent that was only still starting | measured |
 
 ## Where to go next
 
