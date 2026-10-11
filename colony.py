@@ -63,6 +63,9 @@ BRIEF_SECTIONS = ("goal", "inputs", "acceptance criteria", "you may decide",
 # that arrive together. The tests shorten both.
 CHECK_EVERY = float(os.environ.get("COLONY_CHECK_EVERY", 60))
 SETTLE = float(os.environ.get("COLONY_SETTLE", 3))
+# Checks in a row that must find a worker idle before IDLE is reported. The
+# checks are CHECK_EVERY apart, so three of them is about three minutes.
+IDLE_SAMPLES = max(1, int(os.environ.get("COLONY_IDLE_SAMPLES", 3)))
 CHECKPOINT_FRESH = 15 * 60  # restart needs a checkpoint written this recently
 MASTER_WINDOW = "600000"  # Masters compact earlier than other sessions (record 0005)
 
@@ -621,8 +624,31 @@ def cmd_answer(a):
     print(f"answered {task_id}")
 
 
+def waits_for_input(task):
+    """True when the worker's pane is blocked on input, as colony close reads it.
+
+    A worker that asks the user with the question tool waits in its own pane.
+    Waiting is not stopping, so such a worker must not be reported as IDLE. A
+    pane that cannot be read counts as not waiting, so a Herdr hiccup cannot
+    hide a worker that really has stopped.
+    """
+    try:
+        pane = herdr("pane", "get", task["pane"])["result"]["pane"]
+    except (ColonyError, KeyError, TypeError):
+        return False
+    return pane.get("agent_status") == "blocked"
+
+
 def check_workers(sd, idle_seen):
-    """Record LOST for a worker whose agent is gone, IDLE for one idle twice without an outcome."""
+    """Record LOST for a worker whose agent is gone, and IDLE for one that every
+    check in a row has found idle without an outcome.
+
+    A worker is idle between turns, while the Master answers a QUESTION, and
+    while its own question tool waits for the user. Two checks a minute apart
+    do not tell those apart from a worker that stopped: all 10 IDLE events in
+    the archive to 2026-10-11 were followed by a real outcome. So IDLE needs
+    IDLE_SAMPLES checks in a row and a pane that is not waiting for input.
+    """
     for task_id, ev in latest_events(sd).items():
         if ev[2] not in ("STARTED", "ANSWERED"):
             continue
@@ -637,13 +663,14 @@ def check_workers(sd, idle_seen):
                 append_event(sd, task_id, "LOST", "-", "worker agent not found in Herdr")
             continue
         status = info.get("result", {}).get("agent", {}).get("agent_status")
-        if status in ("idle", "done"):
-            if idle_seen.get(task_id):
-                append_event(sd, task_id, "IDLE", "-", "worker stopped without colony done")
-                idle_seen.pop(task_id, None)
-            else:
-                idle_seen[task_id] = True
-        else:
+        if status not in ("idle", "done") or waits_for_input(task):
+            idle_seen.pop(task_id, None)
+            continue
+        seen = idle_seen.get(task_id, 0) + 1
+        idle_seen[task_id] = seen
+        if seen >= IDLE_SAMPLES:
+            append_event(sd, task_id, "IDLE", "-",
+                         f"worker idle for {seen} checks without colony done")
             idle_seen.pop(task_id, None)
 
 

@@ -25,7 +25,7 @@ case "$1 $2" in
       echo "{\"error\":{\"code\":\"agent_not_found\",\"message\":\"agent target $3 not found\"}}"; exit 1
     fi
     echo "{\"result\":{\"agent\":{\"agent_status\":\"${FAKE_STATUS:-working}\"}}}" ;;
-  "pane get") echo "{\"result\":{\"pane\":{\"agent_status\":\"${FAKE_STATUS:-idle}\",\"agent_session\":{\"value\":\"${FAKE_SESSION:-sess-123}\"}}}}" ;;
+  "pane get") echo "{\"result\":{\"pane\":{\"agent_status\":\"${FAKE_PANE_STATUS:-${FAKE_STATUS:-idle}}\",\"agent_session\":{\"value\":\"${FAKE_SESSION:-sess-123}\"}}}}" ;;
   "pane close") echo '{"result":{}}' ;;
   *) echo '{"error":{"message":"unknown"}}'; exit 1 ;;
 esac
@@ -391,6 +391,36 @@ G1J="$(cat "$GSD/tasks/G1.json")"
 check "the revision survives a close" 0 0 "\"revision\": \"$HEAD_SHA\"" "$G1J"
 check "the dirty flag survives a close" 0 0 '"dirty": false' "$G1J"
 cd "$T/proj"
+
+# IDLE: a worker that waits is not a worker that stopped. Its own colony, so
+# the waits below start from an empty event log and offset.
+IDSD="$COLONY_HOME/$SLUG/idlecheck"
+brief ID1
+COLONY_NAME=idlecheck run start ID1 ID1.md;   check "idle colony start" 0 $rc "started ID1" "$out"
+FAKE_STATUS=idle FAKE_PANE_STATUS=blocked COLONY_NAME=idlecheck run wait --timeout 2
+check "a blocked pane is not idle" 0 $rc "no new outcomes" "$out"
+absent "no IDLE while the pane waits for input" "IDLE" "$(cat "$IDSD/events.log")"
+FAKE_STATUS=blocked COLONY_NAME=idlecheck run wait --timeout 2
+check "a blocked agent is not idle" 0 $rc "no new outcomes" "$out"
+absent "no IDLE while the agent is blocked" "IDLE" "$(cat "$IDSD/events.log")"
+FAKE_STATUS=working COLONY_NAME=idlecheck run wait --timeout 2
+check "a working agent is not idle" 0 $rc "no new outcomes" "$out"
+absent "no IDLE while the agent works" "IDLE" "$(cat "$IDSD/events.log")"
+COLONY_IDLE_SAMPLES=50 FAKE_STATUS=idle COLONY_NAME=idlecheck run wait --timeout 2
+check "fewer checks than the threshold" 0 $rc "no new outcomes" "$out"
+absent "no IDLE below the sample count" "IDLE" "$(cat "$IDSD/events.log")"
+FAKE_STATUS=idle COLONY_NAME=idlecheck run wait --timeout 3
+check "a genuinely idle worker is still found" 0 $rc "ID1	IDLE" "$out"
+check "IDLE names how many checks" 0 0 "worker idle for 3 checks without colony done" "$(cat "$IDSD/events.log")"
+check "one IDLE for one idle spell" 0 0 "^1$" "$(grep -c IDLE "$IDSD/events.log")"
+brief ID2
+COLONY_NAME=idlecheck run start ID2 ID2.md
+COLONY_IDLE_SAMPLES=1 FAKE_STATUS=idle COLONY_NAME=idlecheck run wait --timeout 3
+check "the sample count is configurable" 0 $rc "ID2	IDLE" "$out"
+brief ID3
+COLONY_NAME=idlecheck run start ID3 ID3.md
+FAKE_AGENT_GONE=1 COLONY_NAME=idlecheck run wait --timeout 2
+check "a lost worker is still found at once" 0 $rc "ID3	LOST" "$out"
 
 echo "colony tests: $pass passed, $fail failed"
 [[ $fail = 0 ]]

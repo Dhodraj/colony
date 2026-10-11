@@ -186,7 +186,11 @@ The diagram at the top shows two tasks, one of which asks a question. For one ta
    `colony start T2 <brief> --retry-of T1`.
 
 `colony wait` also reports a worker whose pane is gone (LOST) and one that
-stopped without reporting (IDLE). `colony status` shows one line per task.
+every check in a row finds idle (IDLE). A worker is idle between turns, while
+the Master answers a QUESTION, and while its own question tool waits for the
+user. So IDLE needs three checks in a row and a pane that is not waiting for
+input. `COLONY_IDLE_SAMPLES` sets how many checks. `colony status` shows one
+line per task.
 `colony report` counts tokens per worker and for the Master; the next section
 says what it measures.
 
@@ -336,7 +340,7 @@ the Master checks facts at their source.
 | LIVE1: one worker, one-step task | 2026-10-06 | Every step worked. 5 requests, 194k tokens | measured |
 | Benchmark: a new Master and three parallel workers on a research question | 2026-10-06 | Every step worked, including a question, three PASS outcomes, the Master's checks and a restart. 291 requests, 37.8M tokens, about 130k a request. Workers started at 38k | measured |
 | The same 291 requests at the old median context sizes | 2026-10-06 | About 185M tokens, about 5 times as much | estimated, same benchmark |
-| Tests | 2026-10-11 | 182 cases pass against a fake Herdr | `bash tests/colony.sh` |
+| Tests | 2026-10-11 | 196 cases pass against a fake Herdr | `bash tests/colony.sh` |
 | The ledger against the archive | 2026-10-11 | 98 sessions (86 workers, 12 Masters) and their 144 sub-agent transcripts: a second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught | measured, `python3 tests/archive-check.py` |
 
 The benchmark found two faults in `colony report`, both fixed: it undercounted
@@ -364,8 +368,12 @@ output tokens, and it missed the Master's session after a restart.
 - A background command stops after 30 minutes unless its Bash call sets a
   longer timeout (Claude Code 2.1.287). `colony wait` stops at 1,700 seconds
   by default, and the Master runs it again.
-- Unverified: whether `colony wait` reports a worker that waits on the
-  question tool as IDLE.
+- Answered on 2026-10-11: `colony wait` did report a waiting worker as IDLE.
+  All 10 IDLE events in the archive were followed by a real outcome, so none
+  of them found a worker that had stopped. IDLE now needs three checks in a
+  row and a pane that is not waiting for input.
+- Across two separate `colony wait` runs the count starts again, so a worker
+  that stays idle can be reported more than once. Each report is true.
 - One reader per colony: only the Master runs `colony wait`.
 - A Master outside Herdr cannot run a colony.
 - Workers start in the permission mode from settings, `bypassPermissions`.
@@ -422,6 +430,7 @@ work.
 | 2026-10-08 | Every brief pins a model and an effort; the policy moves to `colony-models.json`; bare aliases dropped; Opus 5.5 and Fable banned; the reviewer runs `claude-opus-4-8` | the design decision |
 | 2026-10-11 | `colony report` counts input, output, thinking, cache reads and both cache writes, adds a row for each sub-agent, flags the pinned model against the served one, prices from an optional config block, and prints `--json` | the design decision |
 | 2026-10-11 | A task records `revision`, `dirty`, `verdict` and `retry_of`; `colony close` takes `--accept`, `--reject` or `--partial`, and `colony start` takes `--retry-of` | the design decision |
+| 2026-10-11 | IDLE needs three checks in a row and a pane that is not waiting for input, after all 10 archived IDLE events proved premature | measured |
 
 ## Where to go next
 
