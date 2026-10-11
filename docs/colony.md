@@ -162,6 +162,8 @@ The diagram at the top shows two tasks, one of which asks a question. For one ta
    `--model` and `--effort` override the brief and are validated the same way.
    If Herdr reports the agent as not ready, `colony start` waits for it to
    report a session before giving up; see the limits below.
+   It also names the directories holding the brief and the state with
+   `--add-dir`, so the worker can read its brief without being asked.
    The brief's
    model and effort go into the task JSON and the STARTED event, and
    `colony report` shows them. The prompt names the brief and the steps the
@@ -343,7 +345,7 @@ the Master checks facts at their source.
 | LIVE1: one worker, one-step task | 2026-10-06 | Every step worked. 5 requests, 194k tokens | measured |
 | Benchmark: a new Master and three parallel workers on a research question | 2026-10-06 | Every step worked, including a question, three PASS outcomes, the Master's checks and a restart. 291 requests, 37.8M tokens, about 130k a request. Workers started at 38k | measured |
 | The same 291 requests at the old median context sizes | 2026-10-06 | About 185M tokens, about 5 times as much | estimated, same benchmark |
-| Tests | 2026-10-12 | 206 cases pass against a fake Herdr | `bash tests/colony.sh` |
+| Tests | 2026-10-12 | 211 cases pass against a fake Herdr | `bash tests/colony.sh` |
 | The archive burn analysis | 2026-10-11 | 3.49 billion tokens over every colony run to then. Cache reads were 98.0% of them. Material entered a context 52.3 million times and was read back 3.42 billion times, a re-read factor of 65.4. Command output supplied 65% of what entered a context and file reads 17% | measured, `~/.local/state/claude-system/reviews/colony-burn-2026-10-11/` |
 | The ledger against the archive | 2026-10-11 | Every session recorded by then: 100 of them, 90 workers and 10 Masters, with 147 sub-agent transcripts. A second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught. The archive grows, so run the command again for today's counts | measured, `python3 tests/archive-check.py` |
 
@@ -391,7 +393,20 @@ output tokens, and it missed the Master's session after a restart.
   both listings.
 - One reader per colony: only the Master runs `colony wait`.
 - A Master outside Herdr cannot run a colony.
-- Workers start in the permission mode from settings, `bypassPermissions`.
+- A colony keeps its state outside the project, so a worker's brief and result
+  file sit outside its working directory. `colony start` names those
+  directories for the worker with `--add-dir`. Without that, the worker's first
+  read waits for someone to allow it, and nothing in the event log says why.
+  Measured on 2026-10-12: a worker sat blocked on that question until the
+  Master closed it.
+- A worker inherits `CLAUDE_CONFIG_DIR` from Herdr, and writes its transcript
+  there. `colony report` reads the same variable, so a Master that reads one
+  directory cannot measure a worker that wrote to another. The permission mode
+  also comes from that directory's settings, which is why the question above
+  appears under one config directory and not another.
+- A worker's usage appears in `colony report` only at a turn boundary. One that
+  is paused inside a tool call shows no requests yet, so a token ceiling cannot
+  be enforced mid-turn.
 
 ## Changing the colony
 
@@ -448,6 +463,7 @@ work.
 | 2026-10-11 | IDLE needs three checks in a row and a pane that is not waiting for input, after all 10 archived IDLE events proved premature | measured |
 | 2026-10-11 | The archive burn analysis; the plan to bound a worker's tool output was closed without a benchmark, because the reachable material is 10% to 15% and the proof costs more than the saving | measured |
 | 2026-10-12 | `colony start` waits for an agent Herdr calls not ready, after a live start failed on an agent that was only still starting | measured |
+| 2026-10-12 | `colony start` names the brief and state directories for the worker, after a live worker blocked on a question about reading its own brief | measured |
 
 ## Where to go next
 

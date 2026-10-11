@@ -444,5 +444,14 @@ brief NR3
 FAKE_START_BROKEN=1 run start NR3 NR3.md;     check "another start error still fails" 1 $rc "herdr exploded" "$out"
 absent "no readiness wait for another error" "became ready" "$out"
 
+# A worker is told about the directories holding its brief and its result.
+check "state dir named for the worker" 0 0 "--add-dir $SD" "$(grep 'agent start w-t1' "$FAKE_LOG")"
+absent "the working directory is not named" "--add-dir $T/proj" "$(grep 'agent start w-t1' "$FAKE_LOG")"
+mkdir -p "$T/elsewhere"
+brief AD1; mv AD1.md "$T/elsewhere/AD1.md"
+run start AD1 "$T/elsewhere/AD1.md";          check "a brief outside both starts" 0 $rc "started AD1" "$out"
+check "the brief's own directory is named" 0 0 "--add-dir $T/elsewhere" "$(grep 'agent start w-ad1' "$FAKE_LOG")"
+check "the state dir is named as well" 0 0 "--add-dir $SD" "$(grep 'agent start w-ad1' "$FAKE_LOG")"
+
 echo "colony tests: $pass passed, $fail failed"
 [[ $fail = 0 ]]

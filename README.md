@@ -125,7 +125,7 @@ bash tests/colony.sh
 ```
 
 The tests run colony against a fake `herdr`, so they need no real Herdr. There
-are 206 cases.
+are 211 cases.
 
 ```sh
 python3 tests/archive-check.py

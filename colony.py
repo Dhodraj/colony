@@ -514,6 +514,18 @@ def master_last_model(meta):
     return last
 
 
+def outside_cwd(cwd, *paths):
+    """The given directories that lie outside cwd, each once, in order."""
+    root = os.path.realpath(cwd)
+    out = []
+    for path in paths:
+        real = os.path.realpath(path)
+        if real == root or real.startswith(root + os.sep) or real in out:
+            continue
+        out.append(real)
+    return out
+
+
 def agent_session_of(name):
     """The worker agent's session id, or None when it has none yet."""
     try:
@@ -601,6 +613,11 @@ def cmd_start(a):
                  "--timeout", "60000", "--", "--name", title,
                  "--exclude-dynamic-system-prompt-sections",
                  "--model", model, "--effort", effort]
+        # A colony keeps its state outside the project, so a worker's brief and
+        # result file sit outside its working directory. Name those directories
+        # for the worker, or its first read waits for someone to allow it.
+        for path in outside_cwd(cwd, sd, os.path.dirname(brief)):
+            start += ["--add-dir", path]
         try:
             herdr(*start)
         except ColonyError as e:
