@@ -48,8 +48,21 @@ Master:
   result. Without one the verdict stays unset, and a worker's PASS is never
   read as acceptance.
 - `colony status` prints one line per task; `--all` includes closed tasks.
+- Each worker runs with a PreToolUse hook. It refuses an unbounded read of a
+  file over `retrieval.read_limit_bytes`, 32,000 by default, and names a ranged
+  read, `rg` and `graft skeleton` instead. Searches and graft calls are left
+  alone. `colony close` reports what the hook saw.
+- `colony start --worktree` gives the worker its own Git worktree and branch
+  under the colony state, indexed for graft, so two workers cannot overwrite
+  each other. `colony close` removes it when clean and keeps it when it holds
+  work. The pane carries `COLONY_ROOT`, so `colony done` works inside it.
 - `colony report` shows tokens per worker and for the Master, where those
-  tokens went by category, and a cost when the config holds rates.
+  tokens went by category, and a cost when the config holds rates. It prints
+  weighted units beside the raw token count and names the weighting, because a
+  raw count is not a plan-limit count. `--weights NAME` picks one of the sets
+  in `limit_weights`: `raw`, `api-price` or `cache-free`. The report also costs
+  each accepted change, charging the tasks it retried to the same change, and
+  separates a worker's reviewer from its other sub-agents.
   `--json` prints the same report as data.
 - `colony checkpoint` writes the Master's state file and prints its path.
 - `colony restart --confirm` clears the Master and resumes it from the
@@ -63,9 +76,10 @@ Worker:
 ## The brief workflow
 
 1. `colony brief <id>` writes a template file and prints its path.
-2. Fill in its sections: Goal, Inputs, Acceptance criteria, You may decide,
-   Model, Effort, Result. `colony start` refuses a brief that still holds
-   template placeholders or lacks a section.
+2. Fill in its sections: Goal, Inputs, Acceptance criteria, Owns, You may
+   decide, Model, Effort, Result. Owns names the paths the worker may change,
+   or `-` for none. `colony start` refuses a brief that still holds template
+   placeholders, lacks a section, or names a path an open task already owns.
 3. `colony start <id> <brief>` opens a pane beside the Master (later workers
    stack below). It starts a Claude Code worker on the brief's model and
    effort, then sends it the worker prompt.
@@ -93,7 +107,11 @@ The policy lives in `colony-models.json`. Its keys:
 - `worker_models`: the pinned ids a brief may name.
 - `banned`: ids a brief may not name.
 - `master_model`: the model the Master should run.
-- `reviewer_model`: the model each worker's reviewer sub-agent runs.
+- `subagent_models`: the aliases a worker passes to the Agent tool, one of
+  `sonnet`, `opus`, `haiku` or `fable`. `reviewer` and `explore` go into the
+  worker prompt; `default` goes on the pane as `CLAUDE_CODE_SUBAGENT_MODEL` and
+  covers a sub-agent the worker does not name. The Agent tool takes no pinned
+  id, so a sub-agent cannot be held to one.
 - `efforts`: the allowed effort levels.
 - `pricing` (optional): `units`, and a `models` map of rates per million
   tokens. A rate set may name `input`, `output`, `cache_read`,

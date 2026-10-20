@@ -35,22 +35,39 @@ esac
 FAKE
 chmod +x "$T/herdr"
 
-export COLONY_HERDR="$T/herdr" COLONY_HOME="$T/state" FAKE_LOG="$T/calls.log"
+cat > "$T/graft" <<'FAKE'
+#!/usr/bin/env bash
+echo "graft $*" >> "$FAKE_LOG"
+if [[ "${FAKE_GRAFT_STALE:-0}" = 1 && "$1" = "check" ]]; then
+  echo "graft/ is stale: 3 files changed" >&2; exit 1
+fi
+echo '{"ok":true}'
+FAKE
+chmod +x "$T/graft"
+
+export COLONY_HERDR="$T/herdr" COLONY_GRAFT="$T/graft" COLONY_HOME="$T/state" FAKE_LOG="$T/calls.log"
 export COLONY_CHECK_EVERY=0.2 COLONY_SETTLE=0.1 HERDR_ENV=1 HERDR_PANE_ID=w9:p1
 export COLONY_START_READY_WAIT=0.5
 export CLAUDE_CONFIG_DIR="$T/claude"
 unset COLONY_NAME CLAUDE_CODE_AUTO_COMPACT_WINDOW
-mkdir -p "$T/proj" "$T/results" "$T/claude/projects/x/sess-123/subagents"
+mkdir -p "$T/proj" "$T/results" "$T/claude/projects/x/sess-123/subagents" "$T/norepo"
+# colony keys its state on the project root, so it refuses outside a repository.
+git init -q "$T/proj" 2>/dev/null || git -C "$T/proj" init -q
+printf 'fixture\n' > "$T/proj/seed.txt"
+git -C "$T/proj" -c user.name=colony-tests -c user.email=tests@example.invalid \
+    -c commit.gpgsign=false add seed.txt >/dev/null 2>&1
+git -C "$T/proj" -c user.name=colony-tests -c user.email=tests@example.invalid \
+    -c commit.gpgsign=false commit -qm "fixture" >/dev/null 2>&1
 # Every command below runs in the fake project folder.
 cd "$T/proj"
 SLUG="$(python3 -c 'import re,os;print(re.sub(r"[^A-Za-z0-9]","-",os.getcwd()))')"
 SD="$COLONY_HOME/$SLUG/main"
 echo "result" > "$T/results/r.md"
 brief() { # id -> a filled-in brief at ./<id>.md (model/effort default to a valid pair)
-  printf '# Task %s\n\n## Goal\n\nDo it.\n\n## Inputs\n\n- a.md\n\n## Acceptance criteria\n\n1. It is done.\n\n## You may decide\n\n- wording\n\n## Model\n\nclaude-opus-4-8\n\n## Effort\n\nhigh\n\n## Result\n\nWrite to: %s\n' "$1" "$T/results/r.md" > "$1.md"
+  printf '# Task %s\n\n## Goal\n\nDo it.\n\n## Inputs\n\n- a.md\n\n## Acceptance criteria\n\n1. It is done.\n\n## Owns\n\n- %s.txt\n\n## You may decide\n\n- wording\n\n## Model\n\nclaude-opus-4-8\n\n## Effort\n\nhigh\n\n## Result\n\nWrite to: %s\n' "$1" "$1" "$T/results/r.md" > "$1.md"
 }
 model_effort_brief() { # id, model, effort -> self-contained brief at ./<id>.md
-  printf '# Task %s\n\n## Goal\n\nDo it.\n\n## Inputs\n\n- a.md\n\n## Acceptance criteria\n\n1. It is done.\n\n## You may decide\n\n- wording\n\n## Model\n\n%s\n\n## Effort\n\n%s\n\n## Result\n\nWrite to: %s\n' "$1" "$2" "$3" "$T/results/r.md" > "$1.md"
+  printf '# Task %s\n\n## Goal\n\nDo it.\n\n## Inputs\n\n- a.md\n\n## Acceptance criteria\n\n1. It is done.\n\n## Owns\n\n- %s.txt\n\n## You may decide\n\n- wording\n\n## Model\n\n%s\n\n## Effort\n\n%s\n\n## Result\n\nWrite to: %s\n' "$1" "$1" "$2" "$3" "$T/results/r.md" > "$1.md"
 }
 
 pass=0 fail=0
@@ -80,7 +97,7 @@ HERDR_ENV=0 run start T1 T1.md;               check "start outside Herdr" 2 $rc 
 run start "bad id!" T1.md;                    check "bad id" 2 $rc "bad task id" "$out"
 run start T1 missing.md;                      check "missing brief" 2 $rc "no brief" "$out"
 run start T1 T1.md;                           check "start" 0 $rc "started T1: pane w9:p7, agent w-t1" "$out"
-check "warns without the Master window" 0 0 "CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000" "$out"
+check "warns without the Master window" 0 0 "CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000" "$out"
 check "first worker beside Master" 0 0 "pane split --current --direction right" "$(grep 'pane split' "$FAKE_LOG" | head -1)"
 check "colony name passed" 0 0 "--env COLONY_NAME=main" "$(grep 'pane split' "$FAKE_LOG" | head -1)"
 check "worker flags" 0 0 "-- --name proj T1 --exclude-dynamic-system-prompt-sections" "$(grep 'agent start' "$FAKE_LOG")"
@@ -91,7 +108,7 @@ run start T1 T1.md;                           check "duplicate id" 2 $rc "exists
 FAKE_START_FAIL=1 run start T2 T2.md;         check "start fails" 1 $rc "agent not ready" "$out"
 check "failed start closes pane" 0 0 "pane close w9:p8" "$(tail -1 "$FAKE_LOG")"
 check "failed start logged" 0 0 "START-FAILED" "$(cat "$SD/events.log")"
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000 run start T3 T3.md --model claude-sonnet-5; check "start with model" 0 $rc "started T3" "$out"
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000 run start T3 T3.md --model claude-sonnet-5; check "start with model" 0 $rc "started T3" "$out"
 absent "no warning with the Master window" "AUTO_COMPACT" "$out"
 check "model flag passed" 0 0 "--model claude-sonnet-5" "$(grep 'agent start w-t3' "$FAKE_LOG")"
 check "brief model by default" 0 0 "--model claude-opus-4-8" "$(grep 'agent start w-t1' "$FAKE_LOG")"
@@ -99,7 +116,8 @@ check "brief effort by default" 0 0 "--effort high" "$(grep 'agent start w-t1' "
 check "model and effort logged" 0 0 "model claude-opus-4-8, effort high" "$(grep 'T1	STARTED' "$SD/events.log")"
 check "template has a model" 0 0 "## Model" "$(cat "$SD/briefs/T1.md")"
 check "template has an effort" 0 0 "## Effort" "$(cat "$SD/briefs/T1.md")"
-check "prompt pins the reviewer" 0 0 "reviewer sub-agent, with model claude-opus-4-8" "$(grep 'agent prompt w-t1' "$FAKE_LOG")"
+check "prompt pins the reviewer" 0 0 "reviewer sub-agent, with model opus" "$(grep 'agent prompt w-t1' "$FAKE_LOG")"
+check "the pane carries the sub-agent default" 0 0 "--env CLAUDE_CODE_SUBAGENT_MODEL=sonnet" "$(grep 'pane split' "$FAKE_LOG" | head -1)"
 check "next worker stacks below" 0 0 "pane split w9:p7 --direction down" "$(grep 'pane split' "$FAKE_LOG" | sed -n 3p)"
 
 # Model and Effort sections in a brief
@@ -193,7 +211,15 @@ u='"model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens
   echo "{\"timestamp\":\"2099-01-01T00:01:00Z\",\"requestId\":\"r2\",\"message\":{\"id\":\"m2\",$u}}"
 } > "$T/claude/projects/x/sess-123.jsonl"
 echo "{\"timestamp\":\"2099-01-01T00:02:00Z\",\"requestId\":\"r3\",\"message\":{\"id\":\"m3\",$u}}" > "$T/claude/projects/x/sess-123/subagents/agent-a.jsonl"
-run report;                                   check "report" 0 $rc "T1	opus-5-5	3	126k	35k	35k" "$out"
+run report;                                   check "report" 0 $rc "T1	opus-5-5	3	126k	131k	-	35k	35k" "$out"
+check "the report names its weighting" 0 0 "weighting: api-price" "$out"
+check "the weighting is called an assumption" 0 0 "An assumption, not a published figure" "$out"
+run report --weights raw;                     check "a weighting can be chosen" 0 $rc "weighting: raw" "$out"
+check "raw units equal raw tokens" 0 0 "T1	opus-5-5	3	126k	126k" "$out"
+run report --weights cache-free;              check "the cache-free weighting works" 0 $rc "weighting: cache-free" "$out"
+run report --weights nonesuch;                check "an unknown weighting is refused" 2 $rc "no weighting called" "$out"
+check "it lists the weightings" 0 0 "api-price, cache-free, raw" "$out"
+run report   # later checks read $out, so restore the default report
 check "report master" 0 0 "Master (since" "$out"
 
 # Separate colonies in one project
@@ -250,12 +276,15 @@ echo "{\"timestamp\":\"2099-01-01T00:04:00Z\",\"requestId\":\"q5\",\"message\":{
 echo '{"agentType":"general-purpose","description":"Review L2 against criteria"}' > "$T/claude/projects/x/sess-l2/subagents/agent-a.meta.json"
 
 COLONY_NAME=led run report
-check "ledger keeps the old table" 0 $rc "L1	opus-4-8	3	57k	25k	0k" "$out"
-check "ledger counts a sub-agent" 0 0 "L2	opus-5-5	2	12k	10k	2k" "$out"
+check "ledger keeps the old table" 0 $rc "L1	opus-4-8	3	57k	23k	-	25k	0k" "$out"
+check "ledger counts a sub-agent" 0 0 "L2	opus-5-5	2	12k	2k	-	10k	2k" "$out"
 check "no transcript stays blank" 0 0 "L3	opus-4-8	-	-	-	-" "$out"
 check "ledger breakdown header" 0 0 "row	input	output	thinking	cache read	cache write 5m	cache write 1h	cost" "$out"
 check "ledger breakdown row" 0 0 "L1	0k	2k	1k	50k	1k	4k	-" "$out"
-check "sub-agent type and description" 0 0 "L2	general-purpose	1	2k	Review L2 against criteria" "$out"
+check "sub-agent type and description" 0 0 "L2	reviewer	general-purpose	1	2k	Review L2 against criteria" "$out"
+check "the reviewer is told from other sub-agents" 0 0 "reviewer 4k" "$out"
+check "other sub-agents are counted apart" 0 0 "other 35k" "$out"
+check "the role column is in the sub-agent table" 0 0 "row	role	agent type" "$out"
 check "effort per request" 0 0 "high	2" "$out"
 check "drift noted" 0 0 "brief pinned claude-sonnet-5-5 but claude-opus-5-5 served most requests on 1 row(s): L2" "$out"
 check "missing transcript noted" 0 0 "no transcript found for 1 row(s), so their usage is unavailable, not zero: L3" "$out"
@@ -312,24 +341,27 @@ cfg = json.load(open(os.environ['REPO_CONFIG'])); cfg.pop('pricing', None)
 json.dump(cfg, open(os.path.join(os.environ['T'], 'nopricing.json'), 'w'))"
 COLONY_MODELS_CONFIG="$T/nopricing.json" COLONY_NAME=led run report
 check "config without pricing still works" 0 $rc "no pricing rates configured" "$out"
-echo '{"banned":[],"worker_models":["m"],"master_model":"m","reviewer_model":"m","efforts":["low"],"pricing":{"models":{"m":{"bogus":1}}}}' > "$T/badprice.json"
+echo '{"banned":[],"worker_models":["m"],"master_model":"m","subagent_models":{"default":"sonnet","reviewer":"opus","explore":"sonnet"},"explore_budget":20,"efforts":["low"],"pricing":{"models":{"m":{"bogus":1}}}}' > "$T/badprice.json"
 COLONY_MODELS_CONFIG="$T/badprice.json" COLONY_NAME=led run report
 check "unknown rate name refused" 2 $rc "name bogus; use input, output, cache_read" "$out"
-echo '{"banned":[],"worker_models":["m"],"master_model":"m","reviewer_model":"m","efforts":["low"],"pricing":{"models":{"m":{"input":-1}}}}' > "$T/badprice.json"
+echo '{"banned":[],"worker_models":["m"],"master_model":"m","subagent_models":{"default":"sonnet","reviewer":"opus","explore":"sonnet"},"explore_budget":20,"efforts":["low"],"pricing":{"models":{"m":{"input":-1}}}}' > "$T/badprice.json"
 COLONY_MODELS_CONFIG="$T/badprice.json" COLONY_NAME=led run report
 check "negative rate refused" 2 $rc "not negative" "$out"
-echo '{"banned":[],"worker_models":["m"],"master_model":"m","reviewer_model":"m","efforts":["low"],"pricing":[]}' > "$T/badprice.json"
+echo '{"banned":[],"worker_models":["m"],"master_model":"m","subagent_models":{"default":"sonnet","reviewer":"opus","explore":"sonnet"},"explore_budget":20,"efforts":["low"],"pricing":[]}' > "$T/badprice.json"
 COLONY_MODELS_CONFIG="$T/badprice.json" COLONY_NAME=led run report
 check "bad pricing block refused" 2 $rc "must be an object with a models object" "$out"
 
 # Task metadata: revision, dirty, verdict and retry lineage.
-# $T/proj is not a Git repository, so start records no revision and says why.
+# $T/proj is a Git repository with one commit, so start records its revision.
+# colony start refuses outside a repository, so a task with a null revision can
+# no longer be created; the guard is covered further down.
 brief MD1
 run start MD1 MD1.md;                           check "metadata start" 0 $rc "started MD1" "$out"
 MD1J="$(cat "$SD/tasks/MD1.json")"
-check "no revision outside a repo" 0 0 '"revision": null' "$MD1J"
-check "no dirty flag outside a repo" 0 0 '"dirty": null' "$MD1J"
-check "says why there is no revision" 0 0 '"revision_unavailable": "git rev-parse' "$MD1J"
+check "the revision is the committed HEAD" 0 0 "\"revision\": \"$(git -C "$T/proj" rev-parse HEAD)\"" "$MD1J"
+check "the dirty flag is recorded" 0 0 '"dirty": ' "$MD1J"
+check "no reason is needed when the revision is known" 0 0 '"id": "MD1"' "$MD1J"
+absent "no revision_unavailable when git worked" "revision_unavailable" "$MD1J"
 check "verdict starts unset" 0 0 '"verdict": null' "$MD1J"
 check "retry_of starts unset" 0 0 '"retry_of": null' "$MD1J"
 FAKE_SESSION=sess-m1 run close MD1;            check "close without a verdict" 0 $rc "closed MD1; session sess-m1" "$out"
@@ -338,7 +370,7 @@ check "verdict stays unset" 0 0 '"verdict": null' "$(cat "$SD/tasks/MD1.json")"
 run close MD1 --accept;                        check "verdict after closing" 0 $rc "was closed at" "$out"
 check "verdict after closing is named" 0 0 "verdict accept" "$out"
 check "verdict recorded" 0 0 '"verdict": "accept"' "$(cat "$SD/tasks/MD1.json")"
-check "verdict keeps the revision fields" 0 0 '"revision": null' "$(cat "$SD/tasks/MD1.json")"
+check "verdict keeps the revision fields" 0 0 "\"revision\": \"$(git -C "$T/proj" rev-parse HEAD)\"" "$(cat "$SD/tasks/MD1.json")"
 run close MD1 --accept --reject;               check "two verdicts refused" 2 $rc "name one verdict, not --accept, --reject" "$out"
 brief MD2
 run start MD2 MD2.md;                           check "metadata start MD2" 0 $rc "started MD2" "$out"
@@ -452,6 +484,181 @@ brief AD1; mv AD1.md "$T/elsewhere/AD1.md"
 run start AD1 "$T/elsewhere/AD1.md";          check "a brief outside both starts" 0 $rc "started AD1" "$out"
 check "the brief's own directory is named" 0 0 "--add-dir $T/elsewhere" "$(grep 'agent start w-ad1' "$FAKE_LOG")"
 check "the state dir is named as well" 0 0 "--add-dir $SD" "$(grep 'agent start w-ad1' "$FAKE_LOG")"
+
+# graft is a dependency, as herdr is: no worker starts against a stale index.
+check "the index is checked before a start" 0 0 "graft check $T/proj" "$(grep '^graft check' "$FAKE_LOG" | head -1)"
+brief GR1
+FAKE_GRAFT_STALE=1 run start GR1 GR1.md
+check "a stale index stops the start" 2 $rc "missing or stale" "$out"
+check "it names the fix" 0 0 "graft build" "$out"
+COLONY_GRAFT="$T/no-such-graft" run start GR1 GR1.md
+check "a missing graft stops the start" 2 $rc "colony needs graft" "$out"
+check "the prompt sends the worker to graft" 0 0 "Find code with graft" "$(grep 'agent prompt w-t1' "$FAKE_LOG")"
+check "the prompt names the explore budget" 0 0 "at most 20 of your own tool calls" "$(grep 'agent prompt w-t1' "$FAKE_LOG")"
+check "the prompt names the explore model" 0 0 "sub-agent with model sonnet" "$(grep 'agent prompt w-t1' "$FAKE_LOG")"
+
+# A colony outside a Git repository would key its state on the working
+# directory, so colony start refuses.
+brief NR1
+cp NR1.md "$T/norepo/NR1.md"
+rc=0
+( cd "$T/norepo" && python3 "$COLONY" start NR1 NR1.md >"$T/norepo.out" 2>&1 ) || rc=$?
+check "start outside a repository" 2 $rc "not a Git repository" "$(cat "$T/norepo.out")"
+
+# The read set: which paths differ from HEAD, and a digest of how.
+echo "scratch" > "$T/proj/untracked.txt"
+brief RS1
+run start RS1 RS1.md;                         check "start records the read set" 0 $rc "started RS1" "$out"
+check "the changed paths are recorded" 0 0 'untracked.txt' "$(cat "$SD/tasks/RS1.json")"
+check "a digest of the diff is recorded" 0 0 '"dirty_digest": "' "$(cat "$SD/tasks/RS1.json")"
+check "the revision is recorded" 0 0 '"revision": "' "$(cat "$SD/tasks/RS1.json")"
+check "the dirty flag is true" 0 0 '"dirty": true' "$(cat "$SD/tasks/RS1.json")"
+check "the config directory is recorded" 0 0 "\"config_dir\": \"$T/claude\"" "$(cat "$SD/tasks/RS1.json")"
+rm -f "$T/proj/untracked.txt"
+
+# Cost for each accepted change: only an accepted task counts, and the tasks it
+# retried are charged to the same change.
+COLONY_NAME=led run report
+check "no accepted change before a verdict" 0 $rc "no accepted change yet" "$out"
+COLONY_NAME=led run close L2 --accept
+COLONY_NAME=led run report
+check "an accepted change is costed" 0 $rc "cost for each accepted change" "$out"
+check "the change names the task charged" 0 0 "L2	L2	" "$out"
+check "the verdict reaches the table" 0 0 "accept" "$out"
+check "an average is given" 0 0 "a change costs on average	1 accepted" "$out"
+COLONY_NAME=led run close L1 --reject
+COLONY_NAME=led run report
+absent "a rejected task is not an accepted change" "L1	L1	" "$out"
+check "the units are named in the heading" 0 0 "in api-price units" "$out"
+
+# Ownership: two workers in one tree may not claim the same path.
+owns_brief() { # id, owns-lines -> brief at ./<id>.md
+  printf '# Task %s\n\n## Goal\n\nDo it.\n\n## Inputs\n\n- a.md\n\n## Acceptance criteria\n\n1. It is done.\n\n## Owns\n\n%s\n\n## You may decide\n\n- wording\n\n## Model\n\nclaude-opus-4-8\n\n## Effort\n\nhigh\n\n## Result\n\nWrite to: %s\n' "$1" "$2" "$T/results/r.md" > "$1.md"
+}
+owns_brief OW1 "- src/auth.py"
+run start OW1 OW1.md;                         check "a brief naming its paths starts" 0 $rc "started OW1" "$out"
+check "the task records what it owns" 0 0 '"src/auth.py"' "$(cat "$SD/tasks/OW1.json")"
+check "the event log names the claim" 0 0 "owns src/auth.py" "$(grep OW1 "$SD/events.log")"
+check "the prompt names the Owns section" 0 0 "Change only the paths the brief" "$(grep 'agent prompt w-ow1' "$FAKE_LOG")"
+owns_brief OW2 "- src/auth.py"
+run start OW2 OW2.md;                         check "the same path is refused" 2 $rc "already owns src/auth.py (OW1)" "$out"
+owns_brief OW3 "- src"
+run start OW3 OW3.md;                         check "a parent directory is refused" 2 $rc "already owns src (OW1)" "$out"
+owns_brief OW4 "- src/billing.py"
+run start OW4 OW4.md;                         check "a different path starts" 0 $rc "started OW4" "$out"
+owns_brief OW5 "-"
+run start OW5 OW5.md;                         check "a task that changes no file starts" 0 $rc "started OW5" "$out"
+check "it owns nothing" 0 0 "owns -" "$(grep OW5 "$SD/events.log")"
+owns_brief OW6 "- /etc/passwd"
+run start OW6 OW6.md;                         check "an absolute path is refused" 2 $rc "must not leave it" "$out"
+owns_brief OW7 "- ../outside"
+run start OW7 OW7.md;                         check "a path leaving the root is refused" 2 $rc "must not leave it" "$out"
+run close OW1 --accept >/dev/null 2>&1 || true
+owns_brief OW8 "- src/auth.py"
+run start OW8 OW8.md;                         check "a closed task frees its paths" 0 $rc "started OW8" "$out"
+
+# A worktree for each worker: its own checkout and branch, indexed for graft.
+owns_brief WT1 "- wt1.txt"
+run start WT1 WT1.md --worktree;              check "a worktree start works" 0 $rc "started WT1" "$out"
+check "the worktree is made" 0 0 "worktree" "$(cat "$SD/tasks/WT1.json")"
+[[ -d "$SD/worktrees/WT1" ]] && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: the worktree directory exists"; }
+check "it sits on its own branch" 0 0 "colony/main/wt1" "$(cat "$SD/tasks/WT1.json")"
+check "the branch exists in git" 0 0 "colony/main/wt1" "$(git -C "$T/proj" branch --list 'colony/*')"
+check "the pane opens in the worktree" 0 0 "--cwd $SD/worktrees/WT1" "$(grep 'pane split' "$FAKE_LOG" | tail -1)"
+check "the pane carries the colony root" 0 0 "--env COLONY_ROOT=$T/proj" "$(grep 'pane split' "$FAKE_LOG" | tail -1)"
+check "the event log names the worktree" 0 0 "worktree $SD/worktrees/WT1 on colony/main/wt1" "$(grep WT1 "$SD/events.log")"
+check "graft indexed the worktree" 0 0 "graft build $SD/worktrees/WT1" "$(grep 'graft build' "$FAKE_LOG")"
+# COLONY_ROOT pins the state, so colony done in the worktree reaches the task.
+( cd "$SD/worktrees/WT1" && COLONY_ROOT="$T/proj" python3 "$COLONY" done WT1 PASS "$T/results/r.md" "done" ) > "$T/wt.out" 2>&1 || true
+check "colony done works from inside the worktree" 0 0 "recorded WT1 PASS" "$(cat "$T/wt.out")"
+# A worktree holding work is kept, not discarded.
+printf 'work\n' > "$SD/worktrees/WT1/wt1.txt"
+run close WT1 --accept;                       check "an unclean worktree is kept" 0 $rc "worktree kept" "$out"
+check "it says why it was kept" 0 0 "uncommitted work" "$out"
+[[ -d "$SD/worktrees/WT1" ]] && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: the kept worktree still exists"; }
+# A clean worktree is removed.
+owns_brief WT2 "- wt2.txt"
+run start WT2 WT2.md --worktree;              check "a second worktree start works" 0 $rc "started WT2" "$out"
+run close WT2 --accept;                       check "a clean worktree is removed" 0 $rc "worktree removed" "$out"
+[[ ! -d "$SD/worktrees/WT2" ]] && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: the clean worktree was removed"; }
+# Without the flag nothing changes.
+owns_brief WT3 "- wt3.txt"
+run start WT3 WT3.md;                         check "no worktree without the flag" 0 $rc "started WT3" "$out"
+absent "the task records no worktree" "worktrees/WT3" "$(cat "$SD/tasks/WT3.json")"
+git -C "$T/proj" worktree prune 2>/dev/null || true
+
+# A brief written before the Owns section existed still starts under
+# --no-check, claiming nothing, and says so.
+printf '# Task OLD1\n\n## Goal\n\nDo it.\n\n## Inputs\n\n- a.md\n\n## Acceptance criteria\n\n1. It is done.\n\n## You may decide\n\n- wording\n\n## Model\n\nclaude-opus-4-8\n\n## Effort\n\nhigh\n\n## Result\n\nWrite to: %s\n' "$T/results/r.md" > OLD1.md
+run start OLD1 OLD1.md;                       check "an old brief is refused" 2 $rc "lacks sections: owns" "$out"
+run start OLD1 OLD1.md --no-check;            check "--no-check starts an old brief" 0 $rc "started OLD1" "$out"
+check "it warns that nothing is claimed" 0 0 "claims no path" "$out"
+check "it owns nothing" 0 0 "owns -" "$(grep OLD1 "$SD/events.log")"
+
+# The retrieval hook: an unbounded read of a large file is refused, and the
+# cheap calls are left open.
+rhook() { # tool, json-args -> rc/out
+  rc=0
+  out="$(printf '{"transcript_path":"%s","tool_name":"%s","tool_input":%s}' \
+        "$T/t.jsonl" "$1" "$2" | python3 "$COLONY" retrieval-hook \
+        --read-limit 100 --tally "$T/tally.json" 2>&1)" || rc=$?
+}
+rm -f "$T/tally.json"
+python3 -c "open('$T/big.txt','w').write('x'*500)"
+printf 'small\n' > "$T/small.txt"
+rhook Read "{\"file_path\":\"$T/big.txt\"}"
+check "an unbounded read of a large file is refused" 0 $rc '"permissionDecision": "deny"' "$out"
+check "the refusal gives the size" 0 0 "is 500 bytes" "$out"
+check "the refusal names a range read" 0 0 "limit and offset" "$out"
+check "the refusal names graft" 0 0 "graft skeleton" "$out"
+rhook Read "{\"file_path\":\"$T/big.txt\",\"limit\":50}"
+check "a range read is allowed" 0 $rc; absent "no output for a range read" "." "$out"
+rhook Read "{\"file_path\":\"$T/big.txt\",\"offset\":10}"
+absent "an offset read is allowed" "deny" "$out"
+rhook Read "{\"file_path\":\"$T/small.txt\"}"
+absent "a small file is allowed whole" "deny" "$out"
+rhook Read "{\"file_path\":\"$T/absent.txt\"}"
+absent "a missing file is left to the tool" "deny" "$out"
+rhook Bash "{\"command\":\"cat $T/big.txt\"}"
+check "cat of a large file is refused" 0 $rc "permissionDecision" "$out"
+rhook Bash "{\"command\":\"rg pattern $T/big.txt\"}"
+absent "a search is allowed" "deny" "$out"
+rhook Bash "{\"command\":\"sed -n 1,20p $T/big.txt\"}"
+absent "a ranged sed is allowed" "deny" "$out"
+rhook Bash "{\"command\":\"cat $T/big.txt | head -5\"}"
+absent "a piped cat is left alone" "deny" "$out"
+out="$(printf '{"transcript_path":"%s/subagents/x.jsonl","tool_name":"Read","tool_input":{"file_path":"%s"}}' "$T/s" "$T/big.txt" | python3 "$COLONY" retrieval-hook --read-limit 100 --tally "$T/tally-sub.json" 2>&1)"; rc=$?
+check "a sub-agent read is left alone" 0 $rc; absent "no deny for a sub-agent" "deny" "$out"
+check "the tally counted every decision" 0 0 '"seen": 9' "$(cat "$T/tally.json")"
+check "the tally counted the refusals" 0 0 '"denied": 2' "$(cat "$T/tally.json")"
+
+# The hook reaches the worker, and close says whether it ran.
+owns_brief RH1 "- rh1.txt"
+run start RH1 RH1.md;                         check "start passes the hook" 0 $rc "started RH1" "$out"
+check "the settings file is named" 0 0 "--settings $SD/settings/RH1.json" "$(grep 'agent start w-rh1' "$FAKE_LOG")"
+check "the settings file holds the hook" 0 0 "retrieval-hook --read-limit 32000" "$(cat "$SD/settings/RH1.json")"
+check "the hook matches only Read and Bash" 0 0 '"matcher": "Read|Bash"' "$(cat "$SD/settings/RH1.json")"
+check "the prompt names the range rule" 0 0 "Read a range, not a whole file" "$(grep 'agent prompt w-rh1' "$FAKE_LOG")"
+run close RH1 --accept;                       check "close warns when the hook never ran" 0 $rc "never ran" "$out"
+owns_brief RH2 "- rh2.txt"
+run start RH2 RH2.md >/dev/null 2>&1
+mkdir -p "$SD/retrieval"
+printf '{"seen":7,"denied":3}' > "$SD/retrieval/RH2.json"
+run close RH2 --accept;                       check "close reports what the hook did" 0 $rc "saw 7 calls, refused 3" "$out"
+absent "no warning when the hook ran" "never ran" "$out"
+
+# The Agent tool takes an alias, so the policy must name one.
+for bad in '"reviewer":"claude-opus-4-8"' '"reviewer":"gpt"'; do
+  echo "{\"banned\":[],\"worker_models\":[\"m\"],\"master_model\":\"m\",\"subagent_models\":{\"default\":\"sonnet\",$bad,\"explore\":\"sonnet\"},\"explore_budget\":20,\"efforts\":[\"low\"],\"retrieval\":{\"read_limit_bytes\":1},\"limit_weights\":{\"sets\":{\"raw\":{\"input\":1,\"output\":1,\"cache_read\":1,\"cache_write_5m\":1,\"cache_write_1h\":1}}}}" > "$T/badalias.json"
+  COLONY_MODELS_CONFIG="$T/badalias.json" COLONY_NAME=led run report
+  check "a pinned id is refused as a sub-agent model" 2 $rc "takes an alias" "$out"
+done
+echo "{\"banned\":[],\"worker_models\":[\"m\"],\"master_model\":\"m\",\"subagent_models\":{\"default\":\"sonnet\",\"reviewer\":\"opus\"},\"explore_budget\":20,\"efforts\":[\"low\"],\"retrieval\":{\"read_limit_bytes\":1},\"limit_weights\":{\"sets\":{\"raw\":{\"input\":1,\"output\":1,\"cache_read\":1,\"cache_write_5m\":1,\"cache_write_1h\":1}}}}" > "$T/badalias.json"
+COLONY_MODELS_CONFIG="$T/badalias.json" COLONY_NAME=led run report
+check "a missing role is refused" 2 $rc "lacks 'explore'" "$out"
+echo "{\"banned\":[],\"worker_models\":[\"m\"],\"master_model\":\"m\",\"subagent_models\":{\"default\":\"sonnet\",\"reviewer\":\"opus\",\"explore\":\"sonnet\",\"spare\":\"haiku\"},\"explore_budget\":20,\"efforts\":[\"low\"],\"retrieval\":{\"read_limit_bytes\":1},\"limit_weights\":{\"sets\":{\"raw\":{\"input\":1,\"output\":1,\"cache_read\":1,\"cache_write_5m\":1,\"cache_write_1h\":1}}}}" > "$T/badalias.json"
+COLONY_MODELS_CONFIG="$T/badalias.json" COLONY_NAME=led run report
+check "an unknown role is refused" 2 $rc "names spare" "$out"
 
 echo "colony tests: $pass passed, $fail failed"
 [[ $fail = 0 ]]

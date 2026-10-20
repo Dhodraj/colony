@@ -2,7 +2,26 @@
   "banned": ["claude-opus-5-5", "claude-fable-5-1"],
   "worker_models": ["claude-opus-5", "claude-opus-4-8", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-4-5-20251001"],
   "master_model": "claude-opus-4-8",
-  "reviewer_model": "claude-opus-4-8",
+  "subagent_models": {
+    "note": "Aliases, not pinned ids: the Agent tool's model parameter takes sonnet, opus, haiku or fable. Measured on 2026-10-20, a prompt naming claude-opus-4-8 reached 17 of 221 archived reviewers. default goes on the pane as CLAUDE_CODE_SUBAGENT_MODEL and covers a sub-agent the worker does not name; an explicit model in an Agent call beats it, verified against the real engine.",
+    "default": "sonnet",
+    "reviewer": "opus",
+    "explore": "sonnet"
+  },
+  "explore_budget": 20,
   "efforts": ["low", "medium", "high", "xhigh", "max"],
-  "pricing": {"units": "USD per million tokens", "models": {}}
+  "retrieval": {
+    "note": "A file over read_limit_bytes may not be read whole. Measured over 227 archived workers: 765 of 1,383 Read calls named no range, and the 243 of those over 8,000 tokens carried 9.09M tokens, 91% of all unbounded read volume. 32,000 bytes is about 8,000 tokens.",
+    "read_limit_bytes": 32000
+  },
+  "pricing": {"units": "USD per million tokens", "models": {}},
+  "limit_weights": {
+    "note": "How the plan limits weigh each token kind is unpublished. These sets are assumptions, not facts. api-price follows the published API prices relative to base input; cache-free is our own fitted range, which put the cache-read weight at 0 to 0.05; raw counts every kind at 1 and overstates cache reads.",
+    "default": "api-price",
+    "sets": {
+      "raw": {"input": 1, "output": 1, "cache_read": 1, "cache_write_5m": 1, "cache_write_1h": 1},
+      "api-price": {"input": 1, "output": 5, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 2},
+      "cache-free": {"input": 1, "output": 5, "cache_read": 0, "cache_write_5m": 1.25, "cache_write_1h": 2}
+    }
+  }
 }

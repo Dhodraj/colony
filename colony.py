@@ -25,8 +25,11 @@ Master:
 Worker:
   colony done <id> <status> <result> <summary>   PASS, FAIL, BLOCKED or QUESTION
 
-Start the Master with CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000 claude: Masters
-compact at 600k, other sessions at 800k. colony start warns when it is missing.
+Start the Master with CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000 claude: every
+session compacts at 400k. colony start warns when it is missing.
+
+colony start needs graft, as it needs herdr: it refuses to start a worker
+against a missing or stale graft index. COLONY_GRAFT names the executable.
 
 A project can hold several colonies: set COLONY_NAME (default "main"). Workers
 inherit it. State: $COLONY_HOME (default ~/.local/state/claude-system/colony)/
@@ -36,9 +39,11 @@ inherit it. State: $COLONY_HOME (default ~/.local/state/claude-system/colony)/
 import argparse
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -51,13 +56,15 @@ VERDICTS = ("accept", "reject", "partial")
 # Statuses that wake the Master: worker outcomes plus the ones colony itself detects.
 REPORTED = OUTCOMES + ("LOST", "IDLE", "START-FAILED")
 SUMMARY_MAX = 300
+# The Agent tool's model parameter takes one of these, not a pinned id.
+SUBAGENT_ALIASES = ("sonnet", "opus", "haiku", "fable")
 SCRATCH = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/")
 # A brief must have these sections, so every worker gets the same protocol.
 # Every brief names a pinned model and an effort; both are validated against
 # colony-models.json (models_config). The config, not this file, holds the
 # allowed models, the banned ones and the effort levels, so a fork sets its own
 # policy in one place without editing the code.
-BRIEF_SECTIONS = ("goal", "inputs", "acceptance criteria", "you may decide",
+BRIEF_SECTIONS = ("goal", "inputs", "acceptance criteria", "owns", "you may decide",
                   "model", "effort", "result")
 # Seconds between worker health checks in wait, and seconds to collect outcomes
 # that arrive together. The tests shorten both.
@@ -69,15 +76,23 @@ IDLE_SAMPLES = max(1, int(os.environ.get("COLONY_IDLE_SAMPLES", 3)))
 # Seconds to keep waiting for a worker agent that herdr says is not ready yet.
 START_READY_WAIT = float(os.environ.get("COLONY_START_READY_WAIT", 120))
 CHECKPOINT_FRESH = 15 * 60  # restart needs a checkpoint written this recently
-MASTER_WINDOW = "600000"  # Masters compact earlier than other sessions (record 0005)
+MASTER_WINDOW = "400000"  # The window every session uses (record 0005, 2026-10-19)
 
 PROMPT = (
     "Colony task {id}. Read the brief at {brief} and do the task. Decide alone "
     "only what its \"You may decide\" allows. Ask the user with the question "
     "tool about the user's choices; ask the Master about anything else with "
-    "colony done {id} QUESTION - \"<question>\" and wait. When done: 1. Run "
+    "colony done {id} QUESTION - \"<question>\" and wait. Find code with graft, "
+    "not rg or cat: graft ask, graft grep, graft skeleton. Put independent reads "
+    "in one response. Spend at most {explore_budget} of your own tool calls on "
+    "locating and reading; past that, send one read-only sub-agent with model "
+    "{explore_alias} and a new context to read and report, and work from what it "
+    "returns. Read a range, not a whole file: a hook refuses an unbounded read "
+    "of a large file and names the cheaper call. "
+    "Change only the paths the brief's Owns section names; another "
+    "worker may hold the rest. When done: 1. Run "
     "the tests that apply. 2. Have one read-only reviewer sub-agent, with model "
-    "{reviewer_model} and a new context, check the result against each criterion, in at "
+    "{reviewer_alias} and a new context, check the result against each criterion, in at "
     "most 12 tool calls. "
     "It is not a staff-review. Fix what it finds. 3. Write the result file, "
     "noting checks skipped or partial. 4. Save to memory project facts the next "
@@ -102,6 +117,11 @@ BRIEF_TEMPLATE = """# Task {id}
 
 1. <A check someone who did not write the result can run.>
 2. <...>
+
+## Owns
+
+- <Paths this worker may change, one per line, relative to the project root. No
+  other open task may own the same path. Write `-` when the task changes no file.>
 
 ## You may decide
 
@@ -169,6 +189,16 @@ def parse_ts(ts):
 
 
 def project_root():
+    """The project the colony belongs to.
+
+    COLONY_ROOT pins it, because a worker in a Git worktree has a different
+    work-tree root and would otherwise resolve a different colony state. Its
+    pane carries the variable, so `colony done` in a worktree reaches the task
+    that started it.
+    """
+    pinned = os.environ.get("COLONY_ROOT")
+    if pinned:
+        return pinned
     try:
         out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                              capture_output=True, text=True, timeout=10)
@@ -177,6 +207,16 @@ def project_root():
     except (OSError, subprocess.SubprocessError):
         pass
     return os.getcwd()
+
+
+def in_git_repo(root):
+    """Whether the path sits inside a Git work tree."""
+    try:
+        out = subprocess.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and out.stdout.strip() == "true"
 
 
 def git_state(root):
@@ -211,6 +251,41 @@ def git_state(root):
     if status is None:
         return revision, None, why
     return revision, bool(status.strip()), None
+
+
+def tree_state(root):
+    """(paths, digest, reason) for the uncommitted work in a tree.
+
+    paths names every file that differs from HEAD, including untracked ones.
+    digest is a hash of the porcelain status and the tracked diff, so two
+    workers that read the same working tree carry the same digest. The digest
+    covers the names of untracked files, not their contents, because hashing
+    them would read the whole tree. reason says why either is unknown.
+    """
+    def git(*args):
+        try:
+            out = subprocess.run(["git", "-C", root, *args],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, f"git {args[0]} failed: {e}"
+        if out.returncode != 0:
+            first = (out.stderr.strip().splitlines() or [f"git exited {out.returncode}"])[0]
+            return None, f"git {args[0]}: {first}"
+        return out.stdout, None
+
+    status, why = git("status", "--porcelain")
+    if status is None:
+        return None, None, why
+    paths = sorted(line[3:].strip() for line in status.splitlines() if len(line) > 3)
+    diff, why = git("diff", "HEAD")
+    if diff is None:
+        # A repository with no commit has no HEAD to diff against, so fall back
+        # to the working tree against the index.
+        diff, why2 = git("diff")
+        if diff is None:
+            return paths, None, why2 or why
+    digest = hashlib.sha1((status + diff).encode("utf-8", "replace")).hexdigest()
+    return paths, digest, None
 
 
 def colony_name():
@@ -258,6 +333,233 @@ def herdr(*args):
         msg = err.get("message") or out.stderr.strip() or f"exit {out.returncode}"
         raise ColonyError(f"herdr {' '.join(args[:2])}: {msg}", 1)
     return data
+
+
+def worktree_path(sd, task_id):
+    return os.path.join(sd, "worktrees", task_id)
+
+
+def worktree_branch(task_id):
+    return f"colony/{colony_name()}/{task_id.lower()}"
+
+
+def git_quiet(root, *args):
+    """Run a git command and return (ok, first line of any error)."""
+    try:
+        out = subprocess.run(["git", "-C", root, *args],
+                             capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"git {args[0]} failed: {e}"
+    if out.returncode != 0:
+        first = (out.stderr.strip().splitlines() or [f"git exited {out.returncode}"])[0]
+        return False, f"git {' '.join(args[:2])}: {first}"
+    return True, None
+
+
+def make_worktree(root, sd, task_id):
+    """Create a worktree for a task and index it. Returns (path, branch).
+
+    A worker in its own checkout cannot overwrite a sibling's edits. graft
+    detects the worktree and seeds its index from the parent graph, which took
+    0.25 seconds on a 138-file repository, so the gate still has an index to
+    check.
+    """
+    path = worktree_path(sd, task_id)
+    branch = worktree_branch(task_id)
+    if os.path.exists(path):
+        raise ColonyError(f"{path} exists already; remove it or use a new task id")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ok, why = git_quiet(root, "worktree", "add", "-q", "-b", branch, path, "HEAD")
+    if not ok:
+        raise ColonyError(f"cannot make a worktree for {task_id}: {why}")
+    exe = os.environ.get("COLONY_GRAFT", "graft")
+    try:
+        built = subprocess.run([exe, "build", path], capture_output=True, text=True,
+                               timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        remove_worktree(root, path, force=True)
+        raise ColonyError(f"cannot index the worktree for {task_id}: {e}")
+    if built.returncode != 0:
+        first = (built.stderr.strip() or built.stdout.strip()
+                 or f"exit {built.returncode}").splitlines()[0]
+        remove_worktree(root, path, force=True)
+        raise ColonyError(f"cannot index the worktree for {task_id}: {first}")
+    return path, branch
+
+
+def remove_worktree(root, path, force=False):
+    """Remove a worktree. Returns (removed, why not).
+
+    A worker's work lives in its worktree, so an unclean one is kept, not
+    discarded. force is for cleaning up a start that failed before any worker
+    ran.
+    """
+    if not os.path.exists(path):
+        return True, None
+    if not force:
+        try:
+            out = subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"cannot read the worktree: {e}"
+        if out.returncode != 0 or out.stdout.strip():
+            return False, "it holds uncommitted work"
+    args = ["worktree", "remove", "--force", path] if force else \
+        ["worktree", "remove", path]
+    ok, why = git_quiet(root, *args)
+    if not ok:
+        return False, why
+    git_quiet(root, "worktree", "prune")
+    return True, None
+
+
+def retrieval_policy(cfg):
+    """(read_limit_bytes,) the retrieval policy from the model config."""
+    block = cfg.get("retrieval") or {}
+    limit = block.get("read_limit_bytes")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ColonyError("retrieval.read_limit_bytes in the colony model config "
+                          f"must be a whole number of bytes, at least 1, not {limit!r}")
+    return limit
+
+
+def tally_path(sd, task_id):
+    return os.path.join(sd, "retrieval", task_id + ".json")
+
+
+def bump_tally(path, denied):
+    """Count one hook decision and return (seen, denied)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            try:
+                data = json.loads(f.read() or "{}")
+            except json.JSONDecodeError:
+                data = {}
+            seen = (data.get("seen") or 0) + 1
+            blocked = (data.get("denied") or 0) + (1 if denied else 0)
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps({"seen": seen, "denied": blocked}))
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    return seen, blocked
+
+
+def read_tally(sd, task_id):
+    """{"seen", "denied"} for a task, or None when the hook never ran."""
+    try:
+        with open(tally_path(sd, task_id), encoding="utf-8") as f:
+            data = json.loads(f.read() or "{}")
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not data.get("seen"):
+        return None
+    return data
+
+
+BARE_CAT = re.compile(r"""^cat\s+(-n\s+)?(?P<path>"[^"]+"|'[^']+'|[^\s|<>;&]+)\s*$""")
+
+
+def oversized_target(event, limit):
+    """The path a tool call would read whole, when that file is over the limit.
+
+    Only an unbounded read counts. A read that names a range, a search such as
+    rg or grep, and a graft query all stay untouched: those are the cheap paths
+    this gate exists to leave open.
+    """
+    tool = event.get("tool_name") or ""
+    args = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    path = None
+    if tool == "Read":
+        if args.get("limit") is not None or args.get("offset") is not None:
+            return None
+        path = args.get("file_path")
+    elif tool == "Bash":
+        command = " ".join((args.get("command") or "").split())
+        m = BARE_CAT.match(command)
+        if not m:
+            return None
+        path = m.group("path").strip("\"'")
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        size = os.path.getsize(os.path.expanduser(path))
+    except OSError:
+        return None
+    return (path, size) if size > limit else None
+
+
+def cmd_retrieval_hook(a):
+    """A worker's PreToolUse hook: refuse to read a large file whole.
+
+    Measured over 227 archived workers: 765 of 1,383 Read calls named no range,
+    and the 243 of those over 8,000 tokens carried 9.09M tokens, 91% of all
+    unbounded read volume. A sentence in the prompt did not change this, so the
+    rule is enforced instead of asked for. The reply names the cheaper call, so
+    a worker is never stuck.
+    """
+    raw = sys.stdin.read()
+    try:
+        event = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        return
+    if not isinstance(event, dict):
+        return
+    if "/subagents/" in (event.get("transcript_path") or ""):
+        return
+    over = oversized_target(event, a.read_limit)
+    bump_tally(a.tally, bool(over))
+    if not over:
+        return
+    path, size = over
+    emit_hook({"hookEventName": "PreToolUse", "permissionDecision": "deny",
+               "permissionDecisionReason":
+               f"{path} is {size:,} bytes, over the {a.read_limit:,}-byte limit for "
+               "reading a file whole. Read a range instead, with Read and its "
+               "limit and offset; or search it with rg; or ask graft for the "
+               f"shape: graft skeleton {path}."})
+
+
+def emit_hook(payload):
+    print(json.dumps({"hookSpecificOutput": payload}))
+
+
+def write_worker_settings(sd, task_id, read_limit):
+    """A settings file holding the worker's retrieval hook. Everything the hook
+    needs is on its command line, so it reads no config before each tool call."""
+    command = " ".join([
+        shlex.quote(sys.executable), "-I",
+        shlex.quote(os.path.realpath(__file__)), "retrieval-hook",
+        "--read-limit", str(read_limit),
+        "--tally", shlex.quote(tally_path(sd, task_id))])
+    path = os.path.join(sd, "settings", task_id + ".json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    save_json(path, {"hooks": {"PreToolUse": [
+        {"matcher": "Read|Bash",
+         "hooks": [{"type": "command", "command": command, "timeout": 10}]}]}})
+    return path
+
+
+def graft_check(root):
+    """Raise unless the project has a graft index that matches the code. A worker
+    locates code through graft, so a missing index leaves it reading whole files
+    and a stale one sends it to the wrong lines."""
+    exe = os.environ.get("COLONY_GRAFT", "graft")
+    try:
+        out = subprocess.run([exe, "check", root], capture_output=True, text=True,
+                             timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ColonyError(f"colony needs graft, as it needs herdr, and cannot run it: {e}. "
+                          f"Install graft, then run: graft build {root}")
+    if out.returncode != 0:
+        first = (out.stderr.strip() or out.stdout.strip()
+                 or f"exit {out.returncode}").splitlines()[0]
+        raise ColonyError(f"the graft index for {root} is missing or stale: {first}. "
+                          f"Run: graft build {root}")
 
 
 def herdr_quiet(*args):
@@ -312,11 +614,109 @@ def models_config():
     data = load_json(path)
     if data is None:
         raise ColonyError(f"cannot read the colony model config at {path}")
-    for key in ("banned", "worker_models", "master_model", "reviewer_model", "efforts"):
+    for key in ("banned", "worker_models", "master_model", "subagent_models",
+                "explore_budget", "efforts"):
         if key not in data:
             raise ColonyError(f"the colony model config at {path} lacks {key!r}")
+    budget = data["explore_budget"]
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+        raise ColonyError(f"explore_budget in {path} must be a whole number of tool "
+                          f"calls, at least 1, not {budget!r}")
+    check_subagent_models(data, path)
     check_pricing(data, path)
+    check_limit_weights(data, path)
+    retrieval_policy(data)
     return data
+
+
+def limit_weights(cfg, name=None):
+    """(name, weights) for a named plan-limit weighting.
+
+    Raw tokens are not a safe stand-in for plan-limit use: cache reads are most
+    of the count, and their weight is unpublished. So a weighting is always
+    named, never assumed.
+    """
+    block = cfg.get("limit_weights") or {}
+    sets = block.get("sets") or {}
+    chosen = name or block.get("default")
+    if not sets:
+        raise ColonyError("the colony model config has no limit_weights.sets; "
+                          "add one, because a raw token count is not a limit count")
+    if chosen not in sets:
+        raise ColonyError(f"no weighting called {chosen!r}; use one of: "
+                          + ", ".join(sorted(sets)))
+    return chosen, sets[chosen]
+
+
+def check_limit_weights(cfg, path):
+    """Validate the limit_weights block. Every set names every token category,
+    because a missing category would silently weigh zero."""
+    block = cfg.get("limit_weights")
+    if block is None:
+        raise ColonyError(f"the colony model config at {path} lacks 'limit_weights'")
+    if not isinstance(block, dict) or not isinstance(block.get("sets"), dict) \
+            or not block["sets"]:
+        raise ColonyError(f"limit_weights in {path} must hold a non-empty sets object")
+    for name, weights in block["sets"].items():
+        if not isinstance(weights, dict):
+            raise ColonyError(f"the weighting {name!r} in {path} must be an object")
+        missing = [k for k in RATE_KEYS if k not in weights]
+        if missing:
+            raise ColonyError(f"the weighting {name!r} in {path} lacks "
+                              + ", ".join(missing))
+        for key, value in weights.items():
+            if key not in RATE_KEYS:
+                raise ColonyError(f"the weighting {name!r} in {path} names {key!r}; "
+                                  "use " + ", ".join(RATE_KEYS))
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                raise ColonyError(f"the weight {name!r}.{key} in {path} must be a "
+                                  "number, not negative")
+    default = block.get("default")
+    if default is not None and default not in block["sets"]:
+        raise ColonyError(f"limit_weights.default in {path} is {default!r}, "
+                          "which names no set")
+
+
+def weighted_units(usage, weights):
+    """The usage in weighted units under one weighting.
+
+    A cache write that carries no ephemeral breakdown is charged at the
+    5-minute weight, the cheaper of the two, so an unlabelled write is never
+    silently free. Without this the weighted total would fall below the raw
+    token count even at weight 1.
+    """
+    total = sum((usage.get(k) or 0) * weights[k] for k in RATE_KEYS)
+    unlabelled = (usage.get("cache_write") or 0) \
+        - (usage.get("cache_write_1h") or 0) - (usage.get("cache_write_5m") or 0)
+    if unlabelled > 0:
+        total += unlabelled * weights["cache_write_5m"]
+    return total
+
+
+def check_subagent_models(cfg, path):
+    """Validate the subagent_models block.
+
+    Every value is an alias, not a pinned id, because the Agent tool's model
+    parameter takes only `sonnet`, `opus`, `haiku` or `fable`. Measured on
+    2026-10-20: a prompt naming `claude-opus-4-8` reached 17 of 221 archived
+    reviewers, and the rest rode the newest Opus.
+    """
+    block = cfg.get("subagent_models")
+    if not isinstance(block, dict):
+        raise ColonyError(f"subagent_models in {path} must be an object")
+    roles = ("default", "reviewer", "explore")
+    for key in roles:
+        if key not in block:
+            raise ColonyError(f"subagent_models in {path} lacks {key!r}")
+        if block[key] not in SUBAGENT_ALIASES:
+            raise ColonyError(f"subagent_models.{key} in {path} is {block[key]!r}; "
+                              "the Agent tool takes an alias, one of "
+                              + ", ".join(SUBAGENT_ALIASES))
+    extra = sorted(set(block) - set(roles) - {"note"})
+    if extra:
+        raise ColonyError(f"subagent_models in {path} names " + ", ".join(extra)
+                          + "; use " + ", ".join(roles) + " and an optional note")
+    return block
 
 
 def check_pricing(cfg, path):
@@ -416,6 +816,75 @@ def _section_value(text, name):
     return True, lines[0].split()[0].strip(".:,")
 
 
+def _section_lines(text, name):
+    """(present, [lines]) of a brief's '## <name>' section, bullets stripped."""
+    m = re.search(rf"^#+\s*{name}\s*$(.*?)(?=^#+\s|\Z)", text, re.M | re.S | re.I)
+    if not m:
+        return False, []
+    out = []
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            line = line[2:].strip()
+        elif line == "-":
+            line = "-"
+        if line:
+            out.append(line)
+    return True, out
+
+
+def brief_owns(path):
+    """The paths a brief's Owns section declares, in order and without
+    duplicates. [] means the task changes no file, written as '-'."""
+    with open(path, encoding="utf-8") as f:
+        present, lines = _section_lines(f.read(), "owns")
+    if not present:
+        raise ColonyError("the brief has no Owns section. Name the paths the "
+                          "worker may change, or - for none")
+    if not lines:
+        raise ColonyError("the brief's Owns section is empty. Name the paths the "
+                          "worker may change, or - for none")
+    if lines == ["-"]:
+        return []
+    paths = [line for line in lines if line != "-"]
+    bad = [p for p in paths if p.startswith("/") or ".." in p.split("/")]
+    if bad:
+        raise ColonyError("an owned path must be relative to the project root "
+                          "and must not leave it: " + ", ".join(bad))
+    seen, out = set(), []
+    for item in paths:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def owner_conflicts(sd, paths):
+    """[(path, task id)] where an open task already owns one of these paths.
+
+    Two workers in one tree that change the same file overwrite each other, and
+    discipline alone does not prevent it. So an overlap is refused at the start,
+    not discovered at the merge.
+    """
+    clashes = []
+    for task in all_tasks(sd):
+        if task.get("closed"):
+            continue
+        owned = set(task.get("owns") or [])
+        for path in paths:
+            if path in owned or any(shares_tree(path, other) for other in owned):
+                clashes.append((path, task["id"]))
+    return clashes
+
+
+def shares_tree(one, other):
+    """Whether two declared paths overlap, counting a directory and what is
+    under it as the same claim."""
+    a = one.rstrip("/") + "/"
+    b = other.rstrip("/") + "/"
+    return a.startswith(b) or b.startswith(a)
+
+
 def brief_model_effort(path, cfg, flag_model=None, flag_effort=None):
     """(model, effort) for a worker, from the brief's Model and Effort sections,
     each overridden by its flag. Both are required and validated against cfg."""
@@ -491,6 +960,7 @@ def master_last_model(meta):
     session = meta.get("master_session")
     if not session:
         return None
+    # The Master reads its own transcript, so the current config directory is right.
     files = glob.glob(os.path.join(projects_dir(), "*", session + ".jsonl"))
     if not files:
         return None
@@ -570,11 +1040,37 @@ def cmd_start(a):
         check_brief(brief)
     cfg = models_config()
     model, effort = brief_model_effort(brief, cfg, a.model, a.effort)
+    if a.no_check:
+        # Briefs written before 2026-10-20 have no Owns section. --no-check lets
+        # one start, claiming nothing, so nothing is reserved for it and a
+        # sibling can claim the same path.
+        try:
+            owns = brief_owns(brief)
+        except ColonyError:
+            owns = []
+            print(f"warning: {brief} has no Owns section, so {task_id} claims no "
+                  "path and cannot be protected from a sibling. Add an Owns "
+                  "section to reserve its paths", file=sys.stderr)
+    else:
+        owns = brief_owns(brief)
     if os.environ.get("HERDR_ENV") != "1":
         raise ColonyError("colony start must run in a Herdr pane (HERDR_ENV is not 1)")
+    root = project_root()
+    if not in_git_repo(root):
+        raise ColonyError(f"{root} is not a Git repository. A colony keys its state on "
+                          "the project root, so outside a repository it would key on "
+                          "the working directory and two colonies could share state")
+    graft_check(root)
     sd = state_dir()
     if os.path.exists(os.path.join(sd, "tasks", task_id + ".json")):
         raise ColonyError(f"task {task_id} exists already; use a new id")
+    clashes = owner_conflicts(sd, owns)
+    if clashes:
+        raise ColonyError("another open task already owns "
+                          + ", ".join(f"{path} ({owner})" for path, owner in clashes)
+                          + ". Two workers in one tree that change the same path "
+                            "overwrite each other, so name different paths, or "
+                            "close the other task first")
     retry_of = None
     if a.retry_of:
         retry_of = check_id(a.retry_of)
@@ -587,7 +1083,8 @@ def cmd_start(a):
             raise ColonyError(f"no task {retry_of} in colony {colony_name()} to retry; "
                               "colony status --all lists the tasks")
     # The code a worker starts from cannot be recovered once the tree moves on.
-    revision, dirty, why_no_revision = git_state(project_root())
+    revision, dirty, why_no_revision = git_state(root)
+    dirty_paths, dirty_digest, why_no_tree = tree_state(root)
     meta_path = os.path.join(sd, "colony.json")
     meta = load_json(meta_path, {})
     if not meta.get("master_session"):
@@ -604,8 +1101,19 @@ def cmd_start(a):
         where = ["--current", "--direction", "right"]
     name = agent_name(task_id)
     cwd = os.getcwd()
+    worktree = branch = None
+    if a.worktree:
+        worktree, branch = make_worktree(root, sd, task_id)
+        cwd = worktree
+    # A worker in a worktree has its own work-tree root, so its pane carries the
+    # colony's root. Without it, colony done there would find no task.
     split = herdr("pane", "split", *where, "--cwd", cwd, "--no-focus",
-                  "--env", f"COLONY_NAME={colony_name()}")
+                  "--env", f"COLONY_NAME={colony_name()}",
+                  "--env", f"COLONY_ROOT={root}",
+                  # An explicit model in an Agent call beats this default:
+                  # verified against the real engine on 2026-10-20.
+                  "--env", "CLAUDE_CODE_SUBAGENT_MODEL="
+                           + cfg["subagent_models"]["default"])
     pane = split["result"]["pane"]["pane_id"]
     title = f"{os.path.basename(project_root())} {task_id}"
     try:
@@ -618,6 +1126,10 @@ def cmd_start(a):
         # for the worker, or its first read waits for someone to allow it.
         for path in outside_cwd(cwd, sd, os.path.dirname(brief)):
             start += ["--add-dir", path]
+        # A prompt sentence did not change how workers read, so the rule is
+        # enforced by a hook on the worker's own tool calls.
+        start += ["--settings", write_worker_settings(sd, task_id,
+                                                      retrieval_policy(cfg))]
         try:
             herdr(*start)
         except ColonyError as e:
@@ -628,19 +1140,31 @@ def cmd_start(a):
             print(f"warning: herdr said {name} was not ready; it became ready and was "
                   f"used anyway", file=sys.stderr)
         herdr("agent", "prompt", name,
-              PROMPT.format(id=task_id, brief=brief, reviewer_model=models_config()["reviewer_model"]))
+              PROMPT.format(id=task_id, brief=brief,
+                            reviewer_alias=cfg["subagent_models"]["reviewer"],
+                            explore_alias=cfg["subagent_models"]["explore"],
+                            explore_budget=cfg["explore_budget"]))
     except ColonyError as e:
         herdr_quiet("pane", "close", pane)
+        if worktree:
+            remove_worktree(root, worktree, force=True)
         append_event(sd, task_id, "START-FAILED", "-", str(e))
         raise
     task = {"id": task_id, "agent": name, "pane": pane, "brief": brief, "model": model,
             "effort": effort, "cwd": cwd, "started": now(), "closed": None, "session": None,
-            "revision": revision, "dirty": dirty, "verdict": None, "retry_of": retry_of}
+            "revision": revision, "dirty": dirty, "verdict": None, "retry_of": retry_of,
+            "dirty_paths": dirty_paths, "dirty_digest": dirty_digest,
+            "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"), "owns": owns,
+            "worktree": worktree, "branch": branch, "root": root}
     if why_no_revision:
         task["revision_unavailable"] = why_no_revision
+    if why_no_tree:
+        task["tree_unavailable"] = why_no_tree
     save_task(sd, task)
     append_event(sd, task_id, "STARTED", brief,
-                 f"pane {pane}, agent {name}, model {model}, effort {effort}")
+                 f"pane {pane}, agent {name}, model {model}, effort {effort}, "
+                 f"owns {' '.join(owns) if owns else '-'}"
+                 + (f", worktree {worktree} on {branch}" if worktree else ""))
     print(f"started {task_id}: pane {pane}, agent {name}")
     if os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") != MASTER_WINDOW:
         print(f"warning: this Master compacts at the default window. Next time, start it with "
@@ -728,12 +1252,31 @@ def check_workers(sd, idle_seen):
         if status not in ("idle", "done") or waits_for_input(task):
             idle_seen.pop(task_id, None)
             continue
+        if last_event_kind(sd, task_id) == "IDLE":
+            # Already reported. A second IDLE for the same idle stretch is true
+            # and useless, and it wakes the Master for nothing.
+            continue
         seen = idle_seen.get(task_id, 0) + 1
         idle_seen[task_id] = seen
         if seen >= IDLE_SAMPLES:
             append_event(sd, task_id, "IDLE", "-",
                          f"worker idle for {seen} checks without colony done")
             idle_seen.pop(task_id, None)
+
+
+def last_event_kind(sd, task_id):
+    """The kind of the last event logged for a task, or None."""
+    path = os.path.join(sd, "events.log")
+    kind = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3 and parts[1] == task_id:
+                    kind = parts[2]
+    except OSError:
+        return None
+    return kind
 
 
 def cmd_wait(a):
@@ -810,10 +1353,26 @@ def cmd_close(a):
     task["closed"] = now()
     task["session"] = session
     task["verdict"] = verdict
+    note = ""
+    tally = read_tally(sd, task_id)
+    if tally:
+        note = f"retrieval hook saw {tally['seen']} calls, refused {tally['denied']}"
+    else:
+        note = "the retrieval hook never ran"
+    if task.get("worktree"):
+        # A worker's work lives in its worktree, so an unclean one is kept.
+        removed, why = remove_worktree(task.get("root") or project_root(),
+                                       task["worktree"])
+        note += "; worktree removed" if removed else f"; worktree kept: {why}"
     save_task(sd, task)
-    append_event(sd, task_id, "CLOSED", session or "-", "")
+    append_event(sd, task_id, "CLOSED", session or "-", note or "-")
     print(f"closed {task_id}; session {session or 'unknown'}"
-          + (f"; verdict {verdict}" if verdict else ""))
+          + (f"; verdict {verdict}" if verdict else "")
+          + (f"; {note}" if note else ""))
+    if not tally:
+        print(f"warning: no tool call by {task_id} reached the retrieval hook, so "
+              f"its read limit was never enforced. Check that the worker loaded "
+              f"{os.path.join(sd, 'settings', task_id + '.json')}", file=sys.stderr)
 
 
 def status_lines(sd, show_all):
@@ -831,8 +1390,12 @@ def cmd_status(a):
     print("\n".join(lines) if lines else ("no tasks" if a.all else "no open tasks"))
 
 
-def projects_dir():
-    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+def projects_dir(config_dir=None):
+    """Where transcripts live. A task records the config directory its worker
+    inherited, because a Master that reads one cannot measure a worker that
+    wrote to another."""
+    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") \
+        or os.path.expanduser("~/.claude")
     return os.path.join(base, "projects")
 
 
@@ -963,17 +1526,22 @@ def top_model(usage):
     return max(models, key=lambda m: models[m]["requests"]) if models else None
 
 
-def session_usage(session, since=None):
+def session_usage(session, since=None, config_dir=None):
     """A session's own usage and one entry per sub-agent transcript, or None.
 
     A sub-agent entry carries its agentType and description from its
-    agent-<id>.meta.json. Claude Code never names an agent type "reviewer", so
-    a worker's bounded reviewer cannot be told apart from its other sub-agents
-    here; the type and description are reported as they stand.
+    agent-<id>.meta.json, and a role read from that description. Claude Code
+    names no agent type "reviewer", but the worker prompt names the review, so
+    the description identifies it: it did so in 222 of 253 archived sub-agent
+    transcripts on 2026-10-19.
+
+    config_dir is the directory the worker wrote its transcript to, recorded on
+    the task. Without it a Master that reads one directory cannot measure a
+    worker that wrote to another.
     """
     if not session:
         return None
-    main = glob.glob(os.path.join(projects_dir(), "*", session + ".jsonl"))
+    main = glob.glob(os.path.join(projects_dir(config_dir), "*", session + ".jsonl"))
     if not main:
         return None
     own = transcript_usage(main[0], since)
@@ -1065,6 +1633,15 @@ def task_session(task):
         return None
 
 
+def sub_role(description, agent_type):
+    """"reviewer" when a sub-agent's description names the review, else
+    "other". The role is read from the description because no agent type says
+    it; `agent_type` carries values such as general-purpose and Explore."""
+    if "review" in (description or "").lower():
+        return "reviewer"
+    return "other"
+
+
 def report_rows(sd, meta, tasks):
     """One row per worker and per Master session, newest Master last.
 
@@ -1074,12 +1651,13 @@ def report_rows(sd, meta, tasks):
     """
     rows = []
     for task in tasks:
-        usage = session_usage(task_session(task))
+        usage = session_usage(task_session(task), config_dir=task.get("config_dir"))
         end = parse_ts(task["closed"]) if task.get("closed") else datetime.now(timezone.utc)
         rows.append({"label": task["id"], "kind": "worker", "task": task["id"],
                      "pinned_model": task.get("model"), "pinned_effort": task.get("effort"),
                      "minutes": int((end - parse_ts(task["started"])).total_seconds() // 60),
-                     "since": None, "usage": usage})
+                     "since": None, "usage": usage, "verdict": task.get("verdict"),
+                     "retry_of": task.get("retry_of")})
     since = min(t["started"] for t in tasks)
     sessions = meta.get("master_sessions") or [meta.get("master_session")]
     for i, session in enumerate(s for s in sessions if s):
@@ -1089,7 +1667,7 @@ def report_rows(sd, meta, tasks):
         label = "Master" if i == 0 else f"Master after restart {i}"
         rows.append({"label": label, "kind": "master", "task": None,
                      "pinned_model": None, "pinned_effort": None, "minutes": None,
-                     "since": since, "usage": usage})
+                     "since": since, "usage": usage, "verdict": None, "retry_of": None})
     return rows, since
 
 
@@ -1189,6 +1767,34 @@ def report_json(sd, cfg, meta, rows, since):
     return out
 
 
+def accepted_changes(rows):
+    """[(task id, weighted usage dict, [task ids charged])] for each accepted
+    task, with the cost of the tasks it retried charged to it.
+
+    A worker's PASS is not the Master's verdict, so only an accepted task
+    counts. A retry's predecessor is charged to the same change, because the
+    rework is part of what the change cost.
+    """
+    by_task = {r["task"]: r for r in rows if r["kind"] == "worker"}
+    out = []
+    for row in rows:
+        if row["kind"] != "worker" or row.get("verdict") != "accept":
+            continue
+        charged, seen = [], set()
+        node = row
+        while node is not None and node["task"] not in seen:
+            seen.add(node["task"])
+            charged.append(node["task"])
+            node = by_task.get(node.get("retry_of"))
+        total = blank_usage()
+        for task_id in charged:
+            usage = by_task[task_id].get("usage")
+            if usage:
+                add_usage(total, usage["total"])
+        out.append((row["task"], total, charged))
+    return out
+
+
 def cmd_report(a):
     sd = state_dir()
     note_master_session(sd)
@@ -1208,24 +1814,33 @@ def cmd_report(a):
     if a.json:
         print(json.dumps(report_json(sd, cfg, meta, rows, since), indent=1, default=str))
         return
-    print("task\tmodel\trequests\ttokens\tfirst context\tsub-agents\tminutes")
-    total = 0
+    weighting, weights = limit_weights(cfg, getattr(a, "weights", None))
+    print(f"weighting: {weighting} "
+          f"({', '.join(f'{k} {weights[k]:g}' for k in RATE_KEYS)}). "
+          "An assumption, not a published figure.")
+    print("task\tmodel\trequests\ttokens\tunits\tverdict\tfirst context\tsub-agents\tminutes")
+    total = units = 0
     for row in rows:
         usage = row["usage"]
         if row["kind"] == "worker":
             if usage is None:
-                print(f"{row['task']}\t{short_model(row['pinned_model'])}\t-\t-\t-\t-\t{row['minutes']}")
+                print(f"{row['task']}\t{short_model(row['pinned_model'])}\t-\t-\t-\t"
+                      f"{row.get('verdict') or '-'}\t-\t-\t{row['minutes']}")
                 continue
             print(f"{row['task']}\t{short_model(top_model(usage['total']))}\t"
                   f"{usage['total']['requests']}\t{fmt_k(usage['total']['tokens'])}\t"
+                  f"{fmt_k(weighted_units(usage['total'], weights))}\t"
+                  f"{row.get('verdict') or '-'}\t"
                   f"{fmt_k(usage['own']['first_context'])}\t"
                   f"{fmt_k(usage['total']['tokens'] - usage['own']['tokens'])}\t{row['minutes']}")
         else:
             print(f"{row['label']} (since {row['since']})\t{short_model(top_model(usage['total']))}\t"
-                  f"{usage['total']['requests']}\t{fmt_k(usage['total']['tokens'])}\t-\t"
+                  f"{usage['total']['requests']}\t{fmt_k(usage['total']['tokens'])}\t"
+                  f"{fmt_k(weighted_units(usage['total'], weights))}\t-\t-\t"
                   f"{fmt_k(usage['total']['tokens'] - usage['own']['tokens'])}\t-")
         total += usage["total"]["tokens"]
-    print(f"total\t\t\t{fmt_k(total)}")
+        units += weighted_units(usage["total"], weights)
+    print(f"total\t\t\t{fmt_k(total)}\t{fmt_k(units)}")
     print()
     print("where the tokens went")
     print("row\tinput\toutput\tthinking\tcache read\tcache write 5m\tcache write 1h\tcost")
@@ -1245,14 +1860,33 @@ def cmd_report(a):
     print(f"total\t{fmt_k(grand['input'])}\t{fmt_k(grand['output'])}\t{fmt_thinking(grand)}\t"
           f"{fmt_k(grand['cache_read'])}\t{fmt_k(grand['cache_write_5m'])}\t"
           f"{fmt_k(grand['cache_write_1h'])}\t{fmt_cost(cost)}")
+    accepted = accepted_changes(rows)
+    if accepted:
+        print()
+        print(f"cost for each accepted change, in {weighting} units")
+        print("change\ttasks charged\trequests\ttokens\tunits")
+        ch_units = 0
+        for task_id, usage, charged in accepted:
+            print(f"{task_id}\t{' '.join(charged)}\t{usage['requests']}\t"
+                  f"{fmt_k(usage['tokens'])}\t{fmt_k(weighted_units(usage, weights))}")
+            ch_units += weighted_units(usage, weights)
+        print(f"a change costs on average\t{len(accepted)} accepted\t\t\t"
+              f"{fmt_k(ch_units / len(accepted))}")
+    else:
+        print()
+        print("no accepted change yet: colony close --accept records one")
     subs = [(row, sub) for row in rows if row["usage"] for sub in row["usage"]["subs"]]
     if subs:
         print()
         print("sub-agents")
-        print("row\tagent type\trequests\ttokens\tdescription")
+        print("row\trole\tagent type\trequests\ttokens\tdescription")
+        role_total = {}
         for row, sub in subs:
-            print(f"{row['label']}\t{sub['agent_type'] or '-'}\t{sub['requests']}\t"
+            role = sub_role(sub.get("description"), sub.get("agent_type"))
+            role_total[role] = role_total.get(role, 0) + sub["tokens"]
+            print(f"{row['label']}\t{role}\t{sub['agent_type'] or '-'}\t{sub['requests']}\t"
                   f"{fmt_k(sub['tokens'])}\t{(sub['description'] or '-')[:60]}")
+        print("by role\t" + "\t".join(f"{r} {fmt_k(v)}" for r, v in sorted(role_total.items())))
     efforts = blank_usage()
     for row in rows:
         if row["usage"]:
@@ -1321,6 +1955,9 @@ def main(argv=None):
     s.add_argument("--model", help="the worker's model; overrides the brief's Model section")
     s.add_argument("--effort", help="the worker's effort; overrides the brief's Effort section")
     s.add_argument("--no-check", action="store_true", help="skip the brief section check")
+    s.add_argument("--worktree", action="store_true",
+                   help="give the worker its own Git worktree and branch, indexed "
+                        "for graft, so it cannot overwrite a sibling's edits")
     s.add_argument("--retry-of", dest="retry_of", metavar="ID",
                    help="the task this one retries; it must exist in this colony")
     s.set_defaults(func=cmd_start)
@@ -1351,12 +1988,21 @@ def main(argv=None):
     st.set_defaults(func=cmd_status)
     r = sub.add_parser("report", help="tokens per worker and for the Master")
     r.add_argument("--json", action="store_true", help="the whole report as JSON")
+    r.add_argument("--weights", metavar="NAME",
+                   help="the plan-limit weighting to report in; default "
+                        "limit_weights.default from the model config")
     r.set_defaults(func=cmd_report)
     ck = sub.add_parser("checkpoint", help="write the Master's state file; prints its path")
     ck.set_defaults(func=cmd_checkpoint)
     rs = sub.add_parser("restart", help="clear the Master and resume it from the checkpoint")
     rs.add_argument("--confirm", action="store_true", help="required: the Master's context is cleared")
     rs.set_defaults(func=cmd_restart)
+
+    rh = sub.add_parser("retrieval-hook",
+                        help="a worker's PreToolUse hook; reads the event on stdin")
+    rh.add_argument("--read-limit", type=int, required=True)
+    rh.add_argument("--tally", required=True)
+    rh.set_defaults(func=cmd_retrieval_hook)
     a = p.parse_args(argv)
     try:
         a.func(a)

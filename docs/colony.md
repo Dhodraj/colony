@@ -128,26 +128,30 @@ The figures for 2 and 3 come from 9,034M pool tokens in the 14 days to
 | Messages are held, dropped or misrouted | Outcomes go to a file, not through messages. Nothing can expire |
 | Routine steps cost Master requests | One `colony` command for each routine step |
 | Panes are managed by hand | `colony start` opens a pane and `colony close` closes it |
-| Long Masters lose detail or cost much | Masters compact at 600k, earlier than other sessions (800k). Opt-in: the Master writes a checkpoint and restarts from it |
+| Long Masters lose detail or cost much | Masters compact at 400k, the window every session uses. Opt-in: the Master writes a checkpoint and restarts from it |
 
 The colony does not reduce the work or its quality. The thinking effort, the
 review of each result, the Master's own fact checks, and questions going to the
 user all stay the same. Each brief pins a worker model and an effort, so a
-worker runs the cheapest model that can pass its task. The reviewer runs
-`reviewer_model` (`claude-opus-4-8`). The policy is in `colony-models.json`.
+worker runs the cheapest model that can pass its task. The policy is in
+`colony-models.json`. A sub-agent's model is an alias from `subagent_models`,
+because the Agent tool takes no pinned id. The reviewer asks for `opus`, the
+explorer for `sonnet`.
 
 ## How work moves
 
-Start a Master with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=600000 claude`, and resume
-one with the same prefix before `claude --resume <id>`. Without it, the Master
-compacts at 800k like other sessions, and `colony start` warns.
+Start a Master with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000 claude`, and resume
+one with the same prefix before `claude --resume <id>`. The prefix sets the
+window whatever the settings file in use holds, and `colony start` warns without
+it.
 
 The diagram at the top shows two tasks, one of which asks a question. For one task, in words:
 
 1. Brief: the Master runs `colony brief T1`, which writes a template, and
-   fills in its five sections. The acceptance criteria say in advance what a
-   correct result looks like. "You may decide" says what the worker can settle
-   without asking.
+   fills in its sections. The acceptance criteria say in advance what a
+   correct result looks like. "Owns" names the paths this worker may change,
+   and `colony start` refuses a path an open task already owns. "You may
+   decide" says what the worker can settle without asking.
    The Model and Effort sections are required. The Model names a pinned model
    id from `worker_models` in `colony-models.json`. A bare alias (`opus`,
    `sonnet`, `haiku`) is refused, because an alias floats to the newest model,
@@ -175,9 +179,9 @@ The diagram at the top shows two tasks, one of which asks a question. For one ta
    choice that is the user's goes to the user, with the question tool, in the
    worker's pane.
 5. Check: the worker runs the tests that apply. Then one read-only
-   reviewer sub-agent, on `reviewer_model` (`claude-opus-4-8`) and with a new
-   context, checks the result against each criterion, in at most 12 tool calls.
-   The worker fixes what it finds.
+   reviewer sub-agent, with a new context, checks the result against each
+   criterion, in at most 12 tool calls. The worker fixes what it finds. The
+   prompt asks for `subagent_models.reviewer`, the alias `opus`.
 6. Report: the worker writes the result file, saves to memory any
    project fact the next worker needs, and runs one `colony done`: PASS with
    the lines to confirm, FAIL with the failed criterion, or BLOCKED.
@@ -299,13 +303,21 @@ colony adds no revision to it.
 | A script for each routine step | Run as separate tool calls at about 545k context, the Herdr steps would add about 0.6 billion tokens in 14 days (estimated) | The Master runs Herdr commands itself | the design decision, 2026-10-06 |
 | The worker checks its own result | Checking in the Master costs Master-size requests (650M in report turns, measured). A background sub-agent in the Master starts one more Master turn for its result, so the earlier router idea saved about nothing (estimated) | The Master checks; the Master hands checks to its own sub-agent | measured |
 | A bounded reviewer, not a staff review | Unbounded review runs averaged 5M tokens; a bounded one costs much less | No review; a staff review per task | measured |
-| A brief with five fixed sections | Fixed fields leave less room for doubt and let a passing worker report one line. Anthropic's research system found that vague briefs cause duplicated work and gaps | Free-text briefs | Anthropic research |
+| A brief with fixed sections | Fixed fields leave less room for doubt and let a passing worker report one line. Anthropic's research system found that vague briefs cause duplicated work and gaps | Free-text briefs | Anthropic research |
 | The Master confirms cited lines | A report from another agent is a pointer, not the source | Trust the worker's PASS | the design principle |
-| The Master restart is opt-in | It saves context, but the Master loses its conversation history, which the user values | Auto-compact the Master below 600k | the design decision |
-| Masters compact at 600k, other sessions at 800k | Every Master request carries its context, and its state lives in files (plan, ledger, event log, briefs). Other sessions keep more detail, at about 30% more tokens per hour once past 600k (estimated) | One window for every session; Masters at 200k | the design decision, 2026-10-06 |
+| The Master restart is opt-in | It saves context, but the Master loses its conversation history, which the user values | Auto-compact the Master below 400k | the design decision |
+| Masters compact at 400k, the window every session uses | Every Master request carries its context, and its state lives in files (plan, ledger, event log, briefs). Masters are 36% of all colony spend at 348,563 tokens a request, the dearest request in the colony. This supersedes the 600k of 2026-10-06, which the settings default of 400k had already passed | A Master window above the default; one window set only in settings | the design decision, 2026-10-19 |
 | Every brief pins a model and an effort; the policy lives in `colony-models.json`, and Opus 5.5 and Fable are banned | Opus 5.5 drained the user's tokens, so each worker should run the cheapest model that can pass. A pinned id, not a floating alias, keeps a worker off a banned or costlier model. One config file holds the policy, for a fork to set its own. Tests and an Opus 4.8 reviewer catch a cheaper worker's mistakes | A bare `opus` default; the Master picks any model; a hardcoded policy in the code | the design decision, 2026-10-08 |
 | `colony report` counts each token category, and prices them only from configured rates | One raw total hides that almost all of it is cache reads, which are priced apart from fresh input. Rates change and differ per plan, so a built-in price would be a guess | One token total; prices in the code | measured, 2026-10-11 |
 | A task records its revision, dirty flag, verdict and retried task | None of the four can be read back later: the tree moves on, and a worker's PASS is not the Master's verdict. Tokens for each accepted task cannot be counted without them | Read the revision from the transcript's `gitBranch`; take a PASS as acceptance | the design decision, 2026-10-11 |
+| A worker locates code with graft, puts independent reads in one response, spends at most `explore_budget` of its own tool calls on reading, and hands the rest to one read-only sub-agent on `subagent_models.explore` | 49% of worker responses only read, and no worker in the archive called graft, Grep or Glob once against 24,187 Bash calls. A sub-agent reads in its own context, so its reads never enter the worker's. This lowers raw tokens and the material that enters a context, so it holds under every weighting in [Limits and open questions](#limits-and-open-questions) | Leave the reading to the worker; a size rule on tool output; a findings file between tasks | measured, `~/.local/state/claude-system/reviews/colony-speed-2026-10-19/` |
+| A worker may not read a large file whole, and a PreToolUse hook enforces it rather than the prompt asking | Measured over 227 archived workers: 765 of 1,383 Read calls named no range, and the 243 of those over 8,000 tokens carried 9.09M tokens, 91% of all unbounded read volume. A prompt sentence does not change this. The global `CLAUDE.md` already told every session to search with graft, and the same 227 workers made zero graft, Grep or Glob calls against 24,187 Bash calls. The refusal names a range read, `rg` and `graft skeleton`, so a worker is never stuck. Searches, ranged reads and graft queries stay untouched: they are the cheap paths | A sentence in the worker prompt; a size cap on tool output, costed and rejected on 2026-10-11; no rule | measured, 2026-10-20 |
+| A worker's worktree is opt-in, and `colony close` keeps an unclean one | A worktree stops two workers overwriting each other, which path ownership only advises against. It is opt-in because 55 of 227 archived workers already make their own and a shared tree still suits a single worker. The work lives in the worktree, so discarding an unclean one would destroy it | A worktree for every worker; one shared tree only; remove the worktree on close whatever it holds | measured, 2026-10-20 |
+| Admission checks declared paths, not a blast radius | A radius gate would not fire. Measured on the tupservice wiring graph, which covers all 17 of its JavaScript files: the median file has **0** other files depending on it, and the most connected has 2, which is 12% of the graph. The same holds at depth 1, depth 2 and the full closure. A gate that never fires is machinery with no reader | `graft blast` or `graft callers` over each owned path at admission | measured, 2026-10-20 |
+| A brief names the paths its worker owns, and `colony start` refuses a path an open task already owns | Workers share one working tree. Two that change the same path overwrite each other, and `munderdiffl.in` reports that discipline alone does not prevent it. An overlap is cheaper to refuse at the start than to find at the merge | Detect the clash at merge time; a lock for each file; a worktree for each worker, which the graft gate blocks | the design decision, 2026-10-19 |
+| `colony report` prints weighted units beside raw tokens, under a named weighting from `limit_weights`, and costs each accepted change | Cache reads are 98.3% of the raw count and their plan-limit weight is unpublished, our own fits putting it at 0 to 0.05. A raw total ranks the levers wrongly: it made a request ceiling look like a 26% saving on 2026-10-19, and the ceiling was reverted the same day. The same data reads 9.95B raw, 1.43B at API price weights and 0.45B with cache reads at zero | Report raw tokens alone; pick one weighting and call it the truth; wait for a published weight | measured, 2026-10-19 |
+| A task records the paths that differ from HEAD, a digest of the diff, and the config directory its worker inherited | A revision alone does not identify the code a worker read, and a Master that reads one config directory cannot measure a worker that wrote to another. Both were recorded limits | A boolean dirty flag; one config directory for every session | measured, 2026-10-19 |
+| graft is a dependency, as herdr is: `colony start` refuses to start a worker against a missing or stale index | The worker prompt sends a worker to graft first. A missing index leaves it reading whole files, and a stale one sends it to the wrong lines, which is worse than no index | A warning instead of a refusal; no check | the design decision, 2026-10-19 |
 | A worker's tool output is left as it is | A size rule could reach 10% to 15% of what enters a context, because the mass sits in thousands of small results, not in a few large ones. The instruction already loads into every worker from `CLAUDE.md`, and the archive shows it does not produce the behaviour. Proving an 8% saving needs about 49 paired runs, near 1 billion tokens, and the change could save about 349 million across the whole archive | A sentence in the worker prompt telling a worker to read ranges and filter output; a size threshold on command output | measured, `~/.local/state/claude-system/reviews/colony-burn-2026-10-11/` |
 | Workers are sessions, not sub-agents | A sub-agent's result enters the Master's context, a background one starts a Master turn, and a sub-agent cannot ask the user (see [Workers are not sub-agents](#workers-are-not-sub-agents)) | Sub-agents started by the Master's Agent tool, in the foreground or the background | this page |
 | Herdr panes | The user works in Herdr, and a worker can ask the user in its own pane | Agent teams: experimental and they cannot use Herdr panes. Headless `claude -p`: cannot ask the user and is not visible. OpenRig: did not meet the requirements | the OpenRig spike |
@@ -345,7 +357,10 @@ the Master checks facts at their source.
 | LIVE1: one worker, one-step task | 2026-10-06 | Every step worked. 5 requests, 194k tokens | measured |
 | Benchmark: a new Master and three parallel workers on a research question | 2026-10-06 | Every step worked, including a question, three PASS outcomes, the Master's checks and a restart. 291 requests, 37.8M tokens, about 130k a request. Workers started at 38k | measured |
 | The same 291 requests at the old median context sizes | 2026-10-06 | About 185M tokens, about 5 times as much | estimated, same benchmark |
-| Tests | 2026-10-12 | 211 cases pass against a fake Herdr | `bash tests/colony.sh` |
+| Tests | 2026-10-20 | 307 cases pass against a fake Herdr, a fake graft and a Git fixture repository | `bash tests/colony.sh` |
+| The reviewer's served model | 2026-10-20 | 221 archived reviewers: 129 on `claude-opus-5`, 74 on `claude-opus-5-5`, 17 on `claude-opus-4-8`, 1 on `claude-sonnet-5-5`. The pinned `reviewer_model` reaches 8% of them | measured, `~/.local/state/claude-system/reviews/colony-speed-2026-10-19/` |
+| Thinking against outcome | 2026-10-20 | high 340 thinking tokens a response and 73% PASS of 142 graded; xhigh 542 and 84% of 68; medium 325 and 67% of 6. Inside high effort a FAIL thought a median 420 a response against 321 for a PASS | measured, same folder |
+| The archive speed and burn analysis | 2026-10-19 | 243 sessions: 227 workers, 16 Masters, 342 sub-agent transcripts. 9.95B raw tokens, 98.3% cache reads, a re-read factor of 75.9. Workers 59% of spend, Masters 36% at the dearest request, sub-agents 5% at the cheapest. 49% of worker responses only read. Zero graft, Grep or Glob calls against 24,187 Bash calls. Mean concurrency 1.96, and 69.4% of 122 wall hours had one worker alive. Under API price weights the same data reads 68.4% cache reads, 16.4% cache writes and 15.2% output | measured, `~/.local/state/claude-system/reviews/colony-speed-2026-10-19/` |
 | The archive burn analysis | 2026-10-11 | 3.49 billion tokens over every colony run to then. Cache reads were 98.0% of them. Material entered a context 52.3 million times and was read back 3.42 billion times, a re-read factor of 65.4. Command output supplied 65% of what entered a context and file reads 17% | measured, `~/.local/state/claude-system/reviews/colony-burn-2026-10-11/` |
 | The ledger against the archive | 2026-10-11 | Every session recorded by then: 100 of them, 90 workers and 10 Masters, with 147 sub-agent transcripts. A second count of every category matched `colony report` exactly. Three faults injected on purpose were all caught. The archive grows, so run the command again for today's counts | measured, `python3 tests/archive-check.py` |
 
@@ -361,16 +376,29 @@ output tokens, and it missed the Master's session after a restart.
   holds rates. How the plan limits weigh cache reads against other tokens is
   still not published. Outside reports range from 0 to 1 times a fresh input
   token. So a price-weighted figure is not a plan-limit figure.
-- A worker's reviewer cannot be told from its other sub-agents, because no
-  agent type is called "reviewer". Reviewer cost is not separated.
-- The dirty flag says only that the tree differed from the commit. It does not
-  say how, so a revision does not identify the code a worker read when the flag
-  is true.
+- Answered on 2026-10-19: a worker's reviewer can be told from its other
+  sub-agents by its description. The description names the review in 222 of 253
+  archived sub-agent transcripts. No agent type is called "reviewer", but
+  `agent_type` carries `general-purpose` for 227, `Explore` for 22 and `fork`
+  for 4. Measured reviewer cost: 222 reviewers over 2,256 responses and 133M
+  tokens, 58,844 tokens a response. That is 87% of all sub-agent tokens and
+  2.3% of worker spend. It is also the cheapest request in the colony, against
+  a worker's 208,114 and a Master's 348,563. `colony report` now reports it by
+  role.
+- Answered on 2026-10-19: a task now records `dirty_paths` and
+  `dirty_digest`. `dirty_paths` names every path that differs from HEAD.
+  `dirty_digest` hashes the porcelain status and the tracked diff. Two workers on the same working tree carry the same digest. The
+  digest covers the names of untracked files, not their contents, because
+  hashing them would read the whole tree.
 - No task started before 2026-10-11 has a revision, a dirty flag or a verdict.
   A count of tokens for each accepted task starts from the next task.
-- Nothing reads the verdict yet. `colony report` does not show it.
-- `colony report` looks for transcripts under `CLAUDE_CONFIG_DIR`. A session
-  that ran with another config directory reports as unmeasured.
+- Answered on 2026-10-19: `colony report` shows the verdict and costs each
+  accepted change, charging the tasks it retried to the same change. A task
+  closed without a verdict still shows `-`.
+- A task started from 2026-10-19 records the `config_dir` its worker inherited,
+  and `colony report` reads transcripts from there. A task started before that
+  has no such field, so `colony report` falls back to `CLAUDE_CONFIG_DIR` and a
+  worker that wrote elsewhere still reports as unmeasured.
 - A background command stops after 30 minutes unless its Bash call sets a
   longer timeout (Claude Code 2.1.287). `colony wait` stops at 1,700 seconds
   by default, and the Master runs it again.
@@ -378,19 +406,104 @@ output tokens, and it missed the Master's session after a restart.
   All 10 IDLE events in the archive were followed by a real outcome, so none
   of them found a worker that had stopped. IDLE now needs three checks in a
   row and a pane that is not waiting for input.
-- Across two separate `colony wait` runs the count starts again, so a worker
-  that stays idle can be reported more than once. Each report is true.
+- Answered on 2026-10-19: a worker whose last event is already IDLE is not
+  reported again. The event log is the record, so the suppression survives a
+  new `colony wait`.
 - `herdr agent start` sometimes reports that a worker agent is not ready when the
   agent is only still starting. Measured on 2026-10-12: a start with a 150-second
   timeout failed while the pane already held a running session. The agent
   reported a session id seconds later. So `colony start` waits for the agent to
   report a session before it gives up. `COLONY_START_READY_WAIT` sets how long. A
   start that fails for any other reason still fails at once.
-- A `colony` command run outside a Git repository keys its state on the
-  working directory instead of a project root. One colony in the archive was
-  made that way, holds no task, and lists a Master session that another colony
-  also lists. `tests/archive-check.py` reconciles each session once and names
-  both listings.
+- Answered on 2026-10-19: `colony start` refuses outside a Git repository,
+  because the state would key on the working directory instead of a project
+  root. One colony in the archive was made the old way, holds no task, and
+  lists a Master session that another colony also lists.
+  `tests/archive-check.py` reconciles each session once and names both
+  listings.
+- Every token figure on this page is a raw token count. `colony report` prints
+  weighted units beside the raw count and names its weighting, but this page
+  does not. Raw tokens are not a safe stand-in for plan-limit use. Our own fits put the cache-read weight at 0
+  to 0.05, and cache reads are 98.3% of the raw count. Under API price weights
+  the same data reads 68.4% cache reads, 16.4% cache writes and 15.2% output.
+  With cache reads at zero it reads 52% cache writes and 48% output. See
+  `~/.local/state/claude-system/reviews/weekly-limit-weights-2026-10-06/report.md`.
+  So a saving in raw tokens is not a saving against the limit until the
+  weighting is measured.
+- Workers run git themselves: 5,121 invocations across 227 archived workers.
+  Almost all only read: `status` 1,523, `diff` 1,367, `log` 373, `show` 319,
+  `rev-parse` 289, `ls-files` 235. `commit` appears 29 times, and 16 of 227
+  workers ran any command that changes history. So the commit race has a small
+  exposure. A single committer holding a lease would be machinery for a fault
+  that 7% of workers can reach. Unanswered: whether to forbid a worker
+  from committing at all, which would take capability away from those 16.
+- From 2026-10-20 `colony start --worktree` gives a worker its own checkout and
+  branch. It sits under `<state>/worktrees/<task>`. graft indexes it, detecting
+  the worktree and seeding from the parent graph. A build took 0.25 seconds on
+  a 138-file repository. The pane carries `COLONY_ROOT`, so
+  `colony done` inside the worktree reaches the task that started it.
+  `colony close` removes the worktree only when it is clean, and says why it
+  kept one that holds work. The branch stays either way.
+- 55 of 227 archived workers already create Git worktrees: 97 `add`, 93
+  `remove`, 150 `list` and 10 `prune`. They use them to check out HEAD for a
+  counterfactual measurement, not for isolation, and they clean up after
+  themselves. So a worktree works in this environment and its lifecycle has a
+  working precedent. Those worktrees hold no graft index, which did not matter
+  before the graft gate of 2026-10-19.
+- Answered on 2026-10-20: the reviewer did not run the pinned
+  `reviewer_model`. Over 221 archived reviewers, 129 ran `claude-opus-5`, 74
+  ran `claude-opus-5-5`, 17 ran `claude-opus-4-8` and 1 ran
+  `claude-sonnet-5-5`, so 92% ran something else. The cause is that the Agent
+  tool's `model` parameter takes an alias, not a pinned id. A worker asked for
+  `claude-opus-4-8` could only pass `opus`, which resolves to the newest Opus,
+  and the 129 and 74 counts match that exactly. The policy now names aliases in
+  `subagent_models`, and the prompt asks for `opus`. A pinned id for a
+  sub-agent is still not reachable, so the reviewer rides whatever `opus`
+  means.
+- The model ban reaches a worker, not its sub-agents. 74 of 221 reviewers and 6
+  other sub-agents ran `claude-opus-5-5`, which `colony-models.json` bans.
+  Nothing can pin a sub-agent to an id, so the ban cannot be enforced there.
+- A worker's pane carries `CLAUDE_CODE_SUBAGENT_MODEL`, from
+  `subagent_models.default`. It covers a sub-agent the worker does not name.
+  Verified against the real engine on 2026-10-20: with the variable set to
+  `haiku`, a parent on `claude-haiku-5-5` launched a sub-agent asked for
+  `sonnet`, and the sub-agent transcript shows `claude-sonnet-5-5`. So an
+  explicit model beats the default. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` also
+  exists, carrying the message `Workflow agent model "..." ignored:
+  CLAUDE_CODE_SUBAGENT_MODEL_FORCE is set`. Colony does not set it, because one
+  value would cover the reviewer and the explorer alike.
+- The archive gives no support for capping a worker's thinking. By effort:
+  high ran 153 workers at 340 thinking tokens a response and passed 73% of 142
+  graded; xhigh ran 68 at 542 and passed 84% of 68; medium ran 6 at 325 and
+  passed 67% of 6. Inside high effort, workers that FAILed thought more a
+  response, a median 420 against 321 for those that passed, which reads as a
+  struggling worker thinking more. Every xhigh worker ran Opus 5.5 in the first
+  four days, so the task mix is a confound. `MAX_THINKING_TOKENS` is read
+  directly by the binary and would set a cap, but nothing here says to use one.
+- The retrieval hook refuses an unbounded read of a file over
+  `retrieval.read_limit_bytes`, 32,000 by default, which is about 8,000 tokens.
+  It also refuses a bare `cat <file>` of such a file. It leaves `rg`, a ranged
+  `sed`, a piped `cat` and every graft call alone. A sub-agent's reads do not
+  pass through it. `colony close` reports how many calls the hook saw and how
+  many it refused, and warns when it never ran.
+- Whether a worker's `--settings` hook merges with the user's own hooks or
+  replaces them is still unverified. The hook contract itself is verified: a
+  probe against the real engine on 2026-10-19 showed `additionalContext`
+  reaching the model and `permissionDecision: "deny"` blocking a call, and the
+  payload the retrieval hook emits was checked directly on 2026-10-20. What is
+  untested end to end is a live worker meeting the refusal. A probe needs
+  credentials, and a throwaway config directory has none.
+- The Owns section became required on 2026-10-20, and all 237 briefs on disk at
+  that date lack it. `colony start --no-check` starts such a brief, which then
+  claims no path and warns that a sibling can claim the same one. A brief kept
+  for reuse needs an Owns section added.
+- Workers share one working tree. From 2026-10-19 a brief must name the paths
+  its worker owns. `colony start` refuses a path an open task already owns, and
+  counts a directory and what is under it as one claim. Two things stay open.
+  Nothing stops a worker changing a path it does not own: the claim is advice
+  and a check at the start, not a permission. Nothing serialises the commits
+  either, so two workers can still race on `index.lock`. Mean concurrency is
+  1.96, so neither fault is yet seen.
 - One reader per colony: only the Master runs `colony wait`.
 - A Master outside Herdr cannot run a colony.
 - A colony keeps its state outside the project, so a worker's brief and result
@@ -405,8 +518,17 @@ output tokens, and it missed the Master's session after a restart.
   also comes from that directory's settings, which is why the question above
   appears under one config directory and not another.
 - A worker's usage appears in `colony report` only at a turn boundary. One that
-  is paused inside a tool call shows no requests yet, so a token ceiling cannot
-  be enforced mid-turn.
+  is paused inside a tool call shows no requests yet, so the Master cannot read
+  a worker's spend mid-turn.
+- Answered on 2026-10-19: a ceiling can still be enforced mid-turn, by the
+  worker rather than the Master. A probe against the real engine used a
+  PreToolUse hook passed with `claude --settings`. The hook counts each tool
+  call, injects context with `additionalContext`, and blocks a call with
+  `permissionDecision: "deny"`. Colony does not use this. A request ceiling
+  built on it on 2026-10-19 was reverted the same day. A request is a
+  cache-read cost, and cache reads weigh 0 to 0.05. The mechanism stands. The
+  policy did not. Unverified: whether such a hook merges with the user's own
+  hooks or replaces them.
 
 ## Changing the colony
 
@@ -431,7 +553,19 @@ the model policy, so a fork sets its own in one file. Its keys are:
   `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-5-5`,
   `claude-haiku-4-5-20251001`);
 - `banned`: `claude-opus-5-5` and `claude-fable-5-1`;
-- `master_model` and `reviewer_model`: both `claude-opus-4-8`;
+- `master_model`: `claude-opus-4-8`;
+- `subagent_models`: the aliases `default`, `reviewer` and `explore`, each one
+  of `sonnet`, `opus`, `haiku` or `fable`. `default` goes on the worker's pane
+  as `CLAUDE_CODE_SUBAGENT_MODEL`;
+- `explore_budget` (20): the tool calls a worker may spend on reading before it
+  sends the read-only sub-agent;
+- `retrieval.read_limit_bytes` (32000): the size over which a file may not be
+  read whole;
+- `limit_weights`: named weightings for `colony report`, with `sets` and an
+  optional `default`. Each set weighs `input`, `output`, `cache_read`,
+  `cache_write_1h` and `cache_write_5m`. Colony ships `raw`, `api-price` and
+  `cache-free`, and the block says they are assumptions, because how the plan
+  limits weigh each kind is unpublished;
 - `efforts`: `low`, `medium`, `high`, `xhigh`, `max`;
 - `pricing` (optional): `units`, and a `models` map of rates per million
   tokens. A rate set may name `input`, `output`, `cache_read`,
@@ -464,6 +598,11 @@ work.
 | 2026-10-11 | The archive burn analysis; the plan to bound a worker's tool output was closed without a benchmark, because the reachable material is 10% to 15% and the proof costs more than the saving | measured |
 | 2026-10-12 | `colony start` waits for an agent Herdr calls not ready, after a live start failed on an agent that was only still starting | measured |
 | 2026-10-12 | `colony start` names the brief and state directories for the worker, after a live worker blocked on a question about reading its own brief | measured |
+| 2026-10-19 | The archive speed and burn analysis. The worker prompt sends reading to graft and to one read-only sub-agent under an `explore_budget`; `colony start` refuses a missing or stale graft index; Masters compact at 400k. A request budget with a handover was built and reverted the same day: it moves only cache reads, which weigh 0 to 0.05 on our own fits. The ranked plan is in [`colony-token-plan.md`](colony-token-plan.md) | measured |
+| 2026-10-20 | `colony start --worktree` gives a worker its own checkout and branch, indexed for graft, with `COLONY_ROOT` pinning the colony state; `colony close` keeps a worktree that holds work | measured |
+| 2026-10-20 | A sub-agent's model is an alias in `subagent_models`, and the worker's pane carries `CLAUDE_CODE_SUBAGENT_MODEL`, after measurement showed the pinned `reviewer_model` reached 8% of reviewers. No cap was put on thinking: the archive shows more thinking going with a higher pass rate | measured |
+| 2026-10-20 | A PreToolUse hook passed with `claude --settings` refuses an unbounded read of a file over `retrieval.read_limit_bytes`, and `colony close` reports what it saw | measured |
+| 2026-10-20 | A brief names the paths its worker owns, and `colony start` refuses a path an open task already owns. `--no-check` starts a brief written before the section existed, claiming nothing. A blast-radius gate was measured and not built: the median file in the wiring graph has no dependents | measured |
 
 ## Where to go next
 
@@ -471,5 +610,5 @@ work.
 |---|---|
 | The colony process, step by step | [`colony.svg`](colony.svg) |
 | The decisions and their evidence | [Decisions and their reasons](#decisions-and-their-reasons) |
-| The auto-compact windows: 800k for sessions, 600k for Masters | [Decisions and their reasons](#decisions-and-their-reasons) |
+| The auto-compact window: 400k for every session, Masters included | [Decisions and their reasons](#decisions-and-their-reasons) |
 | The code and tests | [`../colony.py`](../colony.py), [`../tests/colony.sh`](../tests/colony.sh) |
