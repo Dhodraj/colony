@@ -12,22 +12,40 @@ the log in the background, answers questions, and checks results.
 For the full explanation of what colony is and why it works this way, read
 [docs/colony.md](docs/colony.md).
 
+There are two backends. `colony` (`colony.py`) runs each worker in its own
+Herdr pane and needs Herdr. `colonybg` (`colony_bg.py`) runs each worker as a
+`claude --bg` background session instead, with no Herdr call anywhere in it.
+
+The two share every command that is not backend-specific: `brief`, `done`,
+`status`, `report`. They use the same state directory layout too. Either
+tool's `status` and `report` read a colony the other started. But `answer`
+and `close` need the tool that started the worker.
+[docs/colony.md](docs/colony.md#colonybg-the-no-herdr-backend) covers the
+real differences, including the one thing `colonybg` cannot yet do as well:
+restart the Master in place.
+
 ## Requirements
 
 - Python 3, standard library only. No third-party packages.
-- Herdr (required). Herdr is the terminal multiplexer that provides the panes
-  and the agent control. Colony drives it through the `herdr` CLI: it splits
-  panes, starts agents and reads pane state. Without Herdr, colony does not run.
-- The Claude Code CLI (`claude`), which Herdr starts in each worker pane.
+- The Claude Code CLI (`claude`).
 - git, used to find the project root so each project gets its own state.
+- `colony` also needs Herdr (required): the terminal multiplexer that
+  provides the panes and the agent control, driven through the `herdr` CLI.
+  Without Herdr, `colony` does not run; use `colonybg` instead.
+- `colonybg` needs nothing beyond `claude` and git. Open the project with
+  `claude` once first. `claude --bg` refuses a repository that is not
+  trusted, and shows no prompt to accept.
 
 ## Install
 
-Put `colony.py` on your `PATH` and keep `colony-models.json` next to it. For
-example:
+Put `colony.py`, `colony_bg.py` and `colony_core.py` on your `PATH` together,
+and keep `colony-models.json` next to them. `colony_core.py` holds code the
+other two import; run it directly only for the worker-side retrieval hook.
+For example:
 
 ```sh
 ln -s "$PWD/colony.py" ~/.local/bin/colony
+ln -s "$PWD/colony_bg.py" ~/.local/bin/colonybg
 ```
 
 The config is read relative to the script's real path, so the symlink resolves
@@ -72,6 +90,29 @@ Worker:
 
 - `colony done <id> <status> <result> <summary>` records the outcome: PASS,
   FAIL, BLOCKED or QUESTION.
+
+### colonybg, the no-Herdr backend
+
+`colonybg` takes the same `brief`, `done`, `status` and `report` commands,
+unchanged. Where it differs from `colony`:
+
+- `colonybg start <id> <brief>` starts the worker as `claude --bg`, not a
+  pane. There is no `--tab`: a background session has no layout to choose.
+  Its output names the session id, not a pane id.
+- `colonybg answer <id> <text>` and `colonybg close <id>` stop the worker's
+  session first, keeping its conversation, then act. `claude --resume`
+  cannot deliver a second prompt to a session that is still running.
+  Checked against the real CLI: it forks a copy instead. Both refuse when
+  the worker is still running after the stop.
+- `colonybg logs <id>` prints a worker's recent terminal output.
+  `colonybg attach <id>` opens its session in the current terminal. Neither
+  has a `colony` equivalent, since a Herdr pane is already on screen.
+- `colonybg restart --confirm` cannot clear the Master's own context the way
+  `colony restart` injects into its own Herdr pane. It writes a request file
+  instead, for a separate `colonybg watchdog` process to act on. The
+  watchdog stops the Master and starts a new background Master from the
+  checkpoint. It works only when the Master runs as `claude --bg`. See
+  [docs/colony.md](docs/colony.md#colonybg-the-no-herdr-backend).
 
 ## The brief workflow
 
@@ -135,15 +176,26 @@ Edit the config, not the code, to set your own policy.
 | `COLONY_START_READY_WAIT` | `120` | Seconds `colony start` waits for a worker agent that Herdr reports as not ready. It gives up only if the agent never reports a session |
 | `COLONY_IDLE_SAMPLES` | `3` | Health checks in a row that must find a worker idle, with a pane that is not waiting for input, before `colony wait` reports IDLE |
 | `COLONY_SETTLE` | `3` | Seconds `colony wait` waits to collect outcomes that arrive together |
+| `COLONYBG_CLAUDE` | `claude` | The `claude` executable `colonybg` calls |
+
+`COLONY_HOME`, `COLONY_NAME`, `COLONY_MODELS_CONFIG`, `CLAUDE_CONFIG_DIR`,
+`COLONY_CHECK_EVERY`, `COLONY_IDLE_SAMPLES` and `COLONY_SETTLE` work the same
+way for `colonybg`. `COLONY_HERDR` and `COLONY_START_READY_WAIT` are
+`colony`-only: `colonybg` has no pane-readiness race to wait out, since
+`claude --bg` returns only once the session exists (checked against the real
+CLI, not assumed).
 
 ## Tests
 
 ```sh
 bash tests/colony.sh
+bash tests/colony_bg.sh
 ```
 
-The tests run colony against a fake `herdr`, so they need no real Herdr. There
-are 211 cases.
+Each runs its tool against a fake binary (`herdr`, `claude`), so neither needs
+the real one installed. The fake proves the script's own logic, not that the
+real CLI behaves the same way; `docs/colony.md` names what was checked
+against the real `claude` CLI directly.
 
 ```sh
 python3 tests/archive-check.py

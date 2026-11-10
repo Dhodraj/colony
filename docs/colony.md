@@ -25,6 +25,7 @@ Diagram source: [`colony.puml`](colony.puml).
 | What is not solved? | [Limits and open questions](#limits-and-open-questions) |
 | How do I change it? | [Changing the colony](#changing-the-colony) |
 | Where are the details? | [Where to go next](#where-to-go-next) |
+| What if I don't have Herdr? | [colonybg: the no-Herdr backend](#colonybg-the-no-herdr-backend) |
 
 ## What a colony is
 
@@ -88,6 +89,78 @@ The two work together. Each worker uses a sub-agent as its reviewer, and a
 Master still uses sub-agents for quick lookups. Rule of thumb: a question, a
 search or a short bounded check goes to a sub-agent; a task with a deliverable,
 such as a build or a verification, goes to a worker.
+
+## colonybg: the no-Herdr backend
+
+`colony` needs Herdr. A worker is a Herdr pane. `herdr agent start` starts
+it, `herdr agent prompt` drives it, `herdr agent get` finds it idle or gone.
+`colonybg` is the same Master/worker/brief/event-log design with no Herdr
+call anywhere in it. A worker is a `claude --bg` background session instead
+of a pane.
+
+Everything that is not about starting, driving or checking a worker is one
+shared module, `colony_core.py`: briefs, the event log, the retrieval hook,
+worktrees, and `colony report`'s usage pipeline. Neither tool's backend code
+imports the other's.
+
+`colonybg status`, `colonybg report` and a worker's own `colony done` call
+run the exact same code `colony` does. Either tool's `status` and `report`
+read a colony that the other tool started. `answer` and `close` need the tool
+that started the worker, because only that tool can stop the worker. The
+other tool refuses and names the right one. Both key their state the same way
+(`COLONY_HOME`, `COLONY_NAME`, `COLONY_ROOT`), not by which backend holds the
+pane.
+
+The backend swap is not free. Three things `colony` gets from Herdr's live
+pane control have no Herdr-free equivalent yet, checked against the real
+`claude` CLI rather than assumed:
+
+- **No live pane write.** `herdr agent prompt` can deliver a second prompt to
+  a worker's pane while it is still running. `claude --resume` cannot. Tried
+  against a session that was still running, idle or busy, it forked a copy
+  instead of continuing it in place. `colonybg answer` and `colonybg close`
+  stop the worker first (`claude stop`, which keeps its conversation), then
+  act. Answering a worker is a stop-and-resume, not a live interruption.
+  `claude stop`, `logs` and `attach` take only the short id that `claude
+  --bg` prints. Given the full session id, they print "No job matching".
+  So a task keeps both ids. The short id stops and reads the worker. The
+  full id resumes it and finds its transcript for `report`. After a stop,
+  `colonybg` reads `claude agents`. It does not answer or close a worker
+  that still has a live process.
+- **No self-restart.** `colony restart` injects `/clear` and a resume prompt
+  into the Master's own Herdr pane, from the Master's own running tool call.
+  A Master that stopped itself could not then start its replacement. So
+  `colonybg restart --confirm` writes a request file, for a separate
+  `colonybg watchdog` process to pick up. The watchdog stops the Master by
+  its short id and checks that it stopped. Then it starts a new background
+  Master in the same folder with a prompt that names the checkpoint. The new
+  session has a clear context, and the watchdog records its id. Resuming the
+  old session with `/clear` does not work, checked live. The resume leaves
+  the session running, so the next resume starts a copy with the old
+  context. Also, `/clear` gives the session a new id. The new Master runs on
+  the default model, because `claude agents` does not show the old one's
+  model. `colonybg restart` refuses unless the Master's own session is a
+  `claude --bg` session. Run `colonybg watchdog` once per colony: it loops,
+  and Ctrl-C stops it and removes its pid file. Or trigger `colonybg
+  watchdog --once` yourself on a schedule.
+- **No confirmed "waiting for the user" signal.** `herdr pane get` reports
+  `agent_status: blocked` while a worker's own question tool waits for the
+  user. That is how `colony wait` tells "waiting" apart from "idle, maybe
+  stopped" before counting IDLE_SAMPLES. In `claude agents --json --all`, a
+  running session has a pid and a status, `idle` or `busy`, checked live. A
+  session that exited or was stopped keeps its row with no pid and no
+  status. Its state is `done`, `stopped` or `failed`, and `colonybg wait`
+  reports that worker LOST. There is no confirmed state for a
+  worker parked on its own question tool with no terminal attached. A
+  `colonybg` worker that asks the user may be reported IDLE while it waits,
+  same as any other idle worker. Not yet resolved; see
+  [Limits and open questions](#limits-and-open-questions).
+- **Trust.** `claude --bg` refuses a folder that is not trusted, and it
+  shows no prompt to accept. Checked live: a Git repository must be trusted
+  itself, and the trust of a parent folder does not reach it. A worktree
+  takes the trust of its repository, so `colonybg start --worktree` works in
+  a trusted project. Open the project with `claude` once before you run
+  `colonybg` there.
 
 ## The problem
 
@@ -369,6 +442,16 @@ output tokens, and it missed the Master's session after a restart.
 
 ## Limits and open questions
 
+- `colonybg`'s IDLE check cannot yet tell a worker waiting on its own
+  question tool apart from one that stopped. `colony`'s pane-blocked check
+  can. A `colonybg` worker that asks the user may be reported IDLE while it
+  waits. Fixing it needs either a confirmed third status from `claude agents
+  --json` beyond idle/busy, or telling `colonybg` workers to ask the Master
+  with `colony done ID QUESTION` instead. Not yet decided.
+- `colonybg restart` only works when the Master itself runs as `claude
+  --bg`, with a `colonybg watchdog` running to act on the request. The new
+  Master runs on the default model. See
+  [colonybg: the no-Herdr backend](#colonybg-the-no-herdr-backend).
 - Only a research task was benchmarked. A coding task with tests was not.
 - The effect of a cheaper worker model on the plan limits is not measured yet.
   `colony report` shows each worker's model and effort.
