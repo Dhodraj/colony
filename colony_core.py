@@ -29,7 +29,9 @@ OUTCOMES = ("PASS", "FAIL", "BLOCKED", "QUESTION")
 # own claim; the verdict is the Master's, and stays unset until it gives one.
 VERDICTS = ("accept", "reject", "partial")
 # Statuses that wake the Master: worker outcomes plus the ones colony itself detects.
-REPORTED = OUTCOMES + ("LOST", "IDLE", "START-FAILED")
+REPORTED = OUTCOMES + ("LOST", "IDLE", "FAILING", "START-FAILED")
+# Events after which wait keeps checking a worker's health.
+WATCHED = ("STARTED", "ANSWERED", "FAILING")
 SUMMARY_MAX = 300
 # The Agent tool's model parameter takes one of these, not a pinned id.
 SUBAGENT_ALIASES = ("sonnet", "opus", "haiku", "fable")
@@ -48,6 +50,12 @@ SETTLE = float(os.environ.get("COLONY_SETTLE", 3))
 # Checks in a row that must find a worker idle before IDLE is reported. The
 # checks are CHECK_EVERY apart, so three of them is about three minutes.
 IDLE_SAMPLES = max(1, int(os.environ.get("COLONY_IDLE_SAMPLES", 3)))
+# A worker is FAILING when its last FAIL_STREAK tool calls all failed, or when
+# its last tool call failed and its transcript has been silent FAIL_SILENCE
+# seconds since. Either way it has not reported an outcome.
+FAIL_STREAK = max(1, int(os.environ.get("COLONY_FAIL_STREAK", 3)))
+FAIL_SILENCE = float(os.environ.get("COLONY_FAIL_SILENCE", 60))
+TRANSCRIPT_TAIL = 512 * 1024  # bytes of a transcript's end read for the check
 CHECKPOINT_FRESH = 15 * 60  # restart needs a checkpoint written this recently
 MASTER_WINDOW = "400000"  # The window every session uses (record 0005, 2026-10-19)
 
@@ -1004,6 +1012,73 @@ def projects_dir(config_dir=None):
     base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") \
         or os.path.expanduser("~/.claude")
     return os.path.join(base, "projects")
+
+
+def tool_failures(session, config_dir=None):
+    """(failed tool calls in a row at the end, seconds since the transcript
+    last changed) for a worker's session, or None without a transcript.
+
+    A successful tool result ends a run of failures, and so does a typed
+    message, such as the Master's answer, because the worker starts afresh
+    from it. A hook that blocks a tool call counts as a failed call. Only the transcript's end is read: a run of failures is recent."""
+    if not session:
+        return None
+    paths = glob.glob(os.path.join(projects_dir(config_dir), "*", session + ".jsonl"))
+    if not paths:
+        return None
+    path = paths[0]
+    try:
+        size = os.path.getsize(path)
+        silent = time.time() - os.path.getmtime(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - TRANSCRIPT_TAIL))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    if size > TRANSCRIPT_TAIL:
+        lines = lines[1:]  # the first line was cut by the seek
+    streak = 0
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        # isMeta marks text Claude Code adds itself, such as a loaded skill.
+        if not isinstance(rec, dict) or rec.get("type") != "user" or rec.get("isMeta"):
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str):
+            streak = 0
+            continue
+        for item in content if isinstance(content, list) else []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_result":
+                streak = streak + 1 if item.get("is_error") else 0
+            elif item.get("type") == "text":
+                streak = 0
+    return streak, silent
+
+
+def failing_reason(failures):
+    """Why a worker counts as FAILING, or None. See FAIL_STREAK."""
+    if not failures:
+        return None
+    streak, silent = failures
+    if streak >= FAIL_STREAK:
+        return f"last {streak} tool calls failed"
+    if streak and silent >= FAIL_SILENCE:
+        return f"last tool call failed, then {int(silent)}s with no transcript change"
+    return None
+
+
+def check_failing(sd, task_id, session, config_dir):
+    """Record FAILING once per run of failures, until another event follows it."""
+    if last_event_kind(sd, task_id) == "FAILING":
+        return
+    reason = failing_reason(tool_failures(session, config_dir))
+    if reason:
+        append_event(sd, task_id, "FAILING", "-", reason + ", and no outcome yet")
 
 
 def transcript_usage(path, since=None):

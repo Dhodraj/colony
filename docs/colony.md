@@ -270,8 +270,22 @@ The diagram at the top shows two tasks, one of which asks a question. For one ta
 every check in a row finds idle (IDLE). A worker is idle between turns, while
 the Master answers a QUESTION, and while its own question tool waits for the
 user. So IDLE needs three checks in a row and a pane that is not waiting for
-input. `COLONY_IDLE_SAMPLES` sets how many checks. `colony status` shows one
-line per task.
+input. `COLONY_IDLE_SAMPLES` sets how many checks.
+
+`colony wait` reports FAILING for a worker that has no outcome yet when its
+transcript ends in one of two ways. Either three tool calls in a row failed, or
+one failed and the transcript has not changed for 60 seconds since. A successful tool call
+or a typed message, such as the Master's answer, ends a run of failures. A hook
+that blocks a tool call counts as a failure.
+
+FAILING is written once per run of
+failures. `colony wait` keeps checking the worker after it, so a FAILING worker
+that then stops is still reported IDLE or LOST. `COLONY_FAIL_STREAK` and
+`COLONY_FAIL_SILENCE` change the two limits. A worker that thinks for more than
+60 seconds after a failed tool call can be reported FAILING while it is still
+working.
+
+`colony status` shows one line per task.
 `colony report` counts tokens per worker and for the Master; the next section
 says what it measures.
 
@@ -324,7 +338,7 @@ rather than a low one.
 | START-FAILED | `colony start`, when Herdr fails | yes |
 | QUESTION, PASS, FAIL, BLOCKED | the worker | yes |
 | ANSWERED | `colony answer` | no |
-| LOST, IDLE | `colony wait` | yes |
+| LOST, IDLE, FAILING | `colony wait` | yes |
 | CLOSED | `colony close` | no |
 | RESTART | `colony restart` | no |
 
@@ -686,6 +700,7 @@ work.
 | 2026-10-20 | A sub-agent's model is an alias in `subagent_models`, and the worker's pane carries `CLAUDE_CODE_SUBAGENT_MODEL`, after measurement showed the pinned `reviewer_model` reached 8% of reviewers. No cap was put on thinking: the archive shows more thinking going with a higher pass rate | measured |
 | 2026-10-20 | A PreToolUse hook passed with `claude --settings` refuses an unbounded read of a file over `retrieval.read_limit_bytes`, and `colony close` reports what it saw | measured |
 | 2026-10-20 | A brief names the paths its worker owns, and `colony start` refuses a path an open task already owns. `--no-check` starts a brief written before the section existed, claiming nothing. A blast-radius gate was measured and not built: the median file in the wiring graph has no dependents | measured |
+| 2026-11-13 | `colony wait` reports FAILING for a worker whose transcript ends in three failed tool calls, or in one followed by 60 seconds of silence. The rule comes from the sitrep dashboard; it has not been measured on colony workers | the design decision |
 
 ## Where to go next
 

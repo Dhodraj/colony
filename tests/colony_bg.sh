@@ -230,6 +230,13 @@ FAKE_BG_ID=bg-t8 COLONY_NAME=bgwait run start T8 T8.md
 FAKE_AGENTS_JSON="$(ended_row bg-t8 done)" COLONY_NAME=bgwait run wait --timeout 3
 check "wait finds a worker whose session exited" 0 $rc "T8	LOST" "$out"
 check "the exit is named" 0 0 "session ended (state done)" "$out"
+COLONY_NAME=bgwait brief T9
+FAKE_BG_ID=bg-t9 COLONY_NAME=bgwait run start T9 T9.md
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/x"
+ERR='{"type":"user","message":{"content":[{"type":"tool_result","is_error":true}]}}'
+printf '%s\n' "$ERR" "$ERR" "$ERR" > "$CLAUDE_CONFIG_DIR/projects/x/$(task_field T9 session bgwait).jsonl"
+FAKE_AGENTS_JSON="$(agents_row bg-t9 busy)" COLONY_NAME=bgwait run wait --timeout 2
+check "a busy worker whose tool calls keep failing is FAILING" 0 $rc "T9	FAILING" "$out"
 
 # Close and status
 run close T1;                                   check "close" 0 $rc "closed T1; session" "$out"

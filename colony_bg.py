@@ -63,7 +63,8 @@ import sys
 import time
 
 from colony_core import (
-    CHECK_EVERY, SETTLE, IDLE_SAMPLES, REPORTED, VERDICTS, SUMMARY_MAX,
+    CHECK_EVERY, SETTLE, IDLE_SAMPLES, REPORTED, WATCHED, VERDICTS, SUMMARY_MAX,
+    check_failing,
     ColonyError, now, clean, colony_name, state_dir, check_id, load_json,
     save_json, load_task, save_task, latest_events, last_event_kind,
     append_event, read_events, read_tally, remove_worktree, close_verdict,
@@ -340,8 +341,10 @@ def cmd_answer(a):
 
 
 def check_workers_bg(sd, idle_seen):
-    """Record LOST for a worker whose session claude no longer knows of, and
-    IDLE for one that every check in a row has found idle without an outcome.
+    """Record LOST for a worker whose session claude no longer knows of,
+    FAILING for one whose tool calls keep failing (colony_core.FAIL_STREAK),
+    and IDLE for one that every check in a row has found idle without an
+    outcome.
 
     One claude agents --json --all call covers every open task, where colony's
     herdr backend needs one herdr agent get call per task. See check_workers in
@@ -358,7 +361,7 @@ def check_workers_bg(sd, idle_seen):
     """
     by_id = {row.get("id"): row for row in agents_json(all_sessions=True)}
     for task_id, ev in latest_events(sd).items():
-        if ev[2] not in ("STARTED", "ANSWERED"):
+        if ev[2] not in WATCHED:
             continue
         try:
             task = load_task(sd, task_id)
@@ -375,6 +378,7 @@ def check_workers_bg(sd, idle_seen):
                          "without colonybg done")
             idle_seen.pop(task_id, None)
             continue
+        check_failing(sd, task_id, task.get("session"), task.get("config_dir"))
         if row.get("status") == "busy":
             idle_seen.pop(task_id, None)
             continue

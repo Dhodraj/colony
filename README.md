@@ -171,15 +171,18 @@ Edit the config, not the code, to set your own policy.
 | `COLONY_NAME` | `main` | Colony name, so one project can hold several colonies. Workers inherit it |
 | `COLONY_HERDR` | `herdr` | The Herdr executable colony calls |
 | `COLONY_MODELS_CONFIG` | next to the script | Path to the model-policy config, overriding the default location |
-| `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps session transcripts. Colony reads them for `colony report` and the Master-model warning |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps session transcripts. Colony reads them for `colony report`, the Master-model warning and the FAILING check |
 | `COLONY_CHECK_EVERY` | `60` | Seconds between worker health checks during `colony wait` |
 | `COLONY_START_READY_WAIT` | `120` | Seconds `colony start` waits for a worker agent that Herdr reports as not ready. It gives up only if the agent never reports a session |
 | `COLONY_IDLE_SAMPLES` | `3` | Health checks in a row that must find a worker idle, with a pane that is not waiting for input, before `colony wait` reports IDLE |
+| `COLONY_FAIL_STREAK` | `3` | Failed tool calls in a row, at the end of a worker's transcript, after which `colony wait` reports FAILING |
+| `COLONY_FAIL_SILENCE` | `60` | Seconds a worker's transcript must stay unchanged after one failed tool call before `colony wait` reports FAILING |
 | `COLONY_SETTLE` | `3` | Seconds `colony wait` waits to collect outcomes that arrive together |
 | `COLONYBG_CLAUDE` | `claude` | The `claude` executable `colonybg` calls |
 
 `COLONY_HOME`, `COLONY_NAME`, `COLONY_MODELS_CONFIG`, `CLAUDE_CONFIG_DIR`,
-`COLONY_CHECK_EVERY`, `COLONY_IDLE_SAMPLES` and `COLONY_SETTLE` work the same
+`COLONY_CHECK_EVERY`, `COLONY_IDLE_SAMPLES`, `COLONY_FAIL_STREAK`,
+`COLONY_FAIL_SILENCE` and `COLONY_SETTLE` work the same
 way for `colonybg`. `COLONY_HERDR` and `COLONY_START_READY_WAIT` are
 `colony`-only: `colonybg` has no pane-readiness race to wait out, since
 `claude --bg` returns only once the session exists (checked against the real

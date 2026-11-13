@@ -49,7 +49,8 @@ import sys
 import time
 
 from colony_core import (
-    CHECK_EVERY, SETTLE, IDLE_SAMPLES, MASTER_WINDOW, REPORTED, VERDICTS,
+    CHECK_EVERY, SETTLE, IDLE_SAMPLES, MASTER_WINDOW, REPORTED, WATCHED, VERDICTS,
+    check_failing,
     SUMMARY_MAX, ColonyError, now, clean, colony_name, state_dir, check_id,
     load_json, save_json, load_task, save_task, all_tasks, latest_events,
     last_event_kind, append_event, read_events, read_tally, remove_worktree,
@@ -355,7 +356,8 @@ def waits_for_input(task):
 
 
 def check_workers(sd, idle_seen):
-    """Record LOST for a worker whose agent is gone, and IDLE for one that every
+    """Record LOST for a worker whose agent is gone, FAILING for one whose tool
+    calls keep failing (colony_core.FAIL_STREAK), and IDLE for one that every
     check in a row has found idle without an outcome.
 
     A worker is idle between turns, while the Master answers a QUESTION, and
@@ -365,7 +367,7 @@ def check_workers(sd, idle_seen):
     IDLE_SAMPLES checks in a row and a pane that is not waiting for input.
     """
     for task_id, ev in latest_events(sd).items():
-        if ev[2] not in ("STARTED", "ANSWERED"):
+        if ev[2] not in WATCHED:
             continue
         try:
             task = load_task(sd, task_id)
@@ -377,7 +379,10 @@ def check_workers(sd, idle_seen):
             if "not found" in str(e):
                 append_event(sd, task_id, "LOST", "-", "worker agent not found in Herdr")
             continue
-        status = info.get("result", {}).get("agent", {}).get("agent_status")
+        agent = info.get("result", {}).get("agent", {})
+        session = task.get("session") or (agent.get("agent_session") or {}).get("value")
+        check_failing(sd, task_id, session, task.get("config_dir"))
+        status = agent.get("agent_status")
         if status not in ("idle", "done") or waits_for_input(task):
             idle_seen.pop(task_id, None)
             continue

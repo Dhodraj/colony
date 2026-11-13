@@ -458,6 +458,52 @@ COLONY_NAME=idlecheck run start ID3 ID3.md
 FAKE_AGENT_GONE=1 COLONY_NAME=idlecheck run wait --timeout 2
 check "a lost worker is still found at once" 0 $rc "ID3	LOST" "$out"
 
+# FAILING: failed tool calls at the end of a worker's transcript. Workers stay
+# "working", so only the failure rule can wake the Master.
+FLSD="$COLONY_HOME/$SLUG/failcheck"
+TR_OK='{"type":"user","message":{"content":[{"type":"tool_result","is_error":false}]}}'
+TR_ERR='{"type":"user","message":{"content":[{"type":"tool_result","is_error":true}]}}'
+TR_META='{"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"a loaded skill"}]}}'
+TR_TYPED='{"type":"user","message":{"content":"carry on"}}'
+transcript() { # session, records...
+  local f="$T/claude/projects/x/$1.jsonl"; shift; printf '%s\n' "$@" > "$f"
+}
+brief F1
+COLONY_NAME=failcheck run start F1 F1.md
+transcript sess-f1 "$TR_OK" "$TR_ERR" "$TR_ERR" "$TR_ERR"
+FAKE_AGENT_SESSION=sess-f1 COLONY_NAME=failcheck run wait --timeout 2
+check "three failed tool calls in a row are FAILING" 0 $rc "F1	FAILING" "$out"
+check "FAILING names the run" 0 0 "last 3 tool calls failed, and no outcome yet" "$(cat "$FLSD/events.log")"
+FAKE_AGENT_SESSION=sess-f1 COLONY_NAME=failcheck run wait --timeout 1
+check "one FAILING for one run of failures" 0 0 "^1$" "$(grep -c FAILING "$FLSD/events.log")"
+brief F2
+COLONY_NAME=failcheck run start F2 F2.md
+transcript sess-f2 "$TR_ERR" "$TR_ERR" "$TR_ERR" "$TR_OK"
+FAKE_AGENT_SESSION=sess-f2 COLONY_NAME=failcheck run wait --timeout 1
+absent "a success ends the run" "F2	FAILING" "$(cat "$FLSD/events.log")"
+transcript sess-f2 "$TR_ERR" "$TR_ERR"
+COLONY_FAIL_SILENCE=3600 FAKE_AGENT_SESSION=sess-f2 COLONY_NAME=failcheck run wait --timeout 1
+absent "two failures, still writing, are not FAILING" "F2	FAILING" "$(cat "$FLSD/events.log")"
+transcript sess-f2 "$TR_ERR" "$TR_ERR" "$TR_ERR" "$TR_TYPED"
+FAKE_AGENT_SESSION=sess-f2 COLONY_NAME=failcheck run wait --timeout 1
+absent "a typed message ends the run" "F2	FAILING" "$(cat "$FLSD/events.log")"
+transcript sess-f2 "$TR_ERR" "$TR_ERR" "$TR_ERR" "$TR_META"
+FAKE_AGENT_SESSION=sess-f2 COLONY_NAME=failcheck run wait --timeout 2
+check "text Claude Code adds does not end the run" 0 $rc "F2	FAILING" "$out"
+brief F3
+COLONY_NAME=failcheck run start F3 F3.md
+transcript sess-f3 "$TR_OK" "$TR_ERR"
+touch -t 202001010000 "$T/claude/projects/x/sess-f3.jsonl"
+FAKE_AGENT_SESSION=sess-f3 COLONY_NAME=failcheck run wait --timeout 2
+check "one failure, then silence, is FAILING" 0 $rc "F3	FAILING" "$out"
+check "the silence is named" 0 0 "last tool call failed, then [0-9]*s with no transcript change" "$(cat "$FLSD/events.log")"
+brief F4
+COLONY_NAME=failcheck run start F4 F4.md
+FAKE_AGENT_SESSION=sess-none COLONY_NAME=failcheck run wait --timeout 1
+absent "no transcript, no FAILING" "F4	FAILING" "$(cat "$FLSD/events.log")"
+FAKE_STATUS=idle COLONY_IDLE_SAMPLES=1 FAKE_AGENT_SESSION=sess-f1 COLONY_NAME=failcheck run wait --timeout 3
+check "a FAILING worker that stops is still IDLE" 0 0 "F1	IDLE" "$(cat "$FLSD/events.log")"
+
 # An agent herdr calls not ready, which becomes ready, is used rather than lost.
 brief NR1
 FAKE_START_FAIL=1 FAKE_AGENT_SESSION=sess-ready run start NR1 NR1.md
