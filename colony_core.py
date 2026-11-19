@@ -75,7 +75,7 @@ PROMPT = (
     "the tests that apply. 2. Have one read-only reviewer sub-agent, with model "
     "{reviewer_alias} and a new context, check the result against each criterion, in at "
     "most 12 tool calls. "
-    "It is not a staff-review. Fix what it finds. 3. Write the result file, "
+    "It is not a tear-it-apart review. Fix what it finds. 3. Write the result file, "
     "noting checks skipped or partial. 4. Save to memory project facts the next "
     "worker needs. 5. Run exactly one of: colony done {id} PASS <result file> "
     "\"criteria 1-N pass; confirm: <path:line or URL> ...\" | colony done {id} "
