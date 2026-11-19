@@ -35,6 +35,9 @@ restart the Master in place.
 - `colonybg` needs nothing beyond `claude` and git. Open the project with
   `claude` once first. `claude --bg` refuses a repository that is not
   trusted, and shows no prompt to accept.
+- The skill `colony:split-the-work` calls skills from three packages: mstack,
+  pstack and Dhodraj/skills. Without one of them, the skill does that step
+  as its own text describes it and says which skill was missing.
 
 ## Install as a Claude Code plugin
 
