@@ -36,6 +36,16 @@ restart the Master in place.
   `claude` once first. `claude --bg` refuses a repository that is not
   trusted, and shows no prompt to accept.
 
+## Install as a Claude Code plugin
+
+Run `/plugin marketplace add Dhodraj/colony`, then `/plugin install colony@colony`.
+
+The plugin puts `colony` and `colonybg` on the PATH of Claude's Bash tool. It also adds the skill `colony:split-the-work`.
+
+Herdr is still a separate install. `colony` needs it. `colonybg` does not.
+
+To use the commands in your own terminal, keep the `ln -s` lines from the Install section below.
+
 ## Install
 
 Put `colony.py`, `colony_bg.py` and `colony_core.py` on your `PATH` together,

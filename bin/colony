@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+root="$here/.."
+exec python3 "$root/colony.py" "$@"

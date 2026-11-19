@@ -1,0 +1,13 @@
+{
+  "name": "colony",
+  "owner": {
+    "name": "Dhodraj"
+  },
+  "plugins": [
+    {
+      "name": "colony",
+      "source": "./",
+      "description": "Run a batch of tickets as one Claude Code worker per ticket, in Herdr panes (colony) or claude --bg sessions (colonybg), with a brief check, an event log and PASS/FAIL/QUESTION results."
+    }
+  ]
+}
